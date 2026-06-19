@@ -112,6 +112,9 @@ add_library(nanoarrow2parquet::single ALIAS nanoarrow2parquet_single)
 if(N2P_BUILD_EXAMPLES)
     add_executable(arrow2parquet_demo examples/arrow2parquet_demo.cpp)
     target_link_libraries(arrow2parquet_demo PRIVATE nanoarrow2parquet nanoarrow_static)
+
+    add_executable(pcapng2parquet examples/pcapng2parquet.cpp)
+    target_link_libraries(pcapng2parquet PRIVATE nanoarrow2parquet nanoarrow_static)
 endif()
 
 if(N2P_BUILD_TESTS)

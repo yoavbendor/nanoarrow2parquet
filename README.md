@@ -74,6 +74,20 @@ if (n2p_write_file("out.parquet", &schema, &batch, err, sizeof err) != N2P_OK) {
 }
 ```
 
+### Example: pcapng → Parquet
+
+[`examples/pcapng2parquet.cpp`](examples/pcapng2parquet.cpp) is a self-contained
+pcap/pcapng → Parquet converter (the write-only counterpart to nanolance's
+`pcapng2lance`). It streams the all-scalar L1 packet-metadata table — `packet_id`,
+`interface_id`, `ts_raw`, `caplen`, `origlen`, `link_type`, `ts_resol`,
+`epb_flags` — flushing one row group per `--window-rows`, with `-d/-c` packet
+slicing. See [`examples/pcapng2parquet.md`](examples/pcapng2parquet.md).
+
+```sh
+cmake --build build --target pcapng2parquet
+./build/pcapng2parquet capture.pcapng packets.parquet
+```
+
 ### With soatins (nanotins)
 
 `soatins::arrow_schema<T>()` + `soatins::to_arrow(soa, batch)` already produce
