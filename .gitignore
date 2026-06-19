@@ -1,0 +1,11 @@
+# Build output
+/build/
+/build-*/
+# FetchContent dependency sources/caches
+/.deps/
+# Editor / tooling
+compile_commands.json
+*.o
+*.a
+# Local test artifacts
+*.parquet

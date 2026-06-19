@@ -1,0 +1,28 @@
+nanoarrow2parquet
+Copyright 2026 Yoav Bendor
+
+Licensed under the Apache License, Version 2.0 (the "License"); see the LICENSE
+file. You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+-------------------------------------------------------------------------------
+Apache Parquet format
+-------------------------------------------------------------------------------
+nanoarrow2parquet is an independent C++ implementation of a minimal Apache
+Parquet writer. It does NOT link the Parquet reference implementation; it writes
+the format directly. Its Thrift field ids and enum values are derived from the
+Apache Parquet `parquet.thrift` definition:
+
+    Apache Parquet — https://github.com/apache/parquet-format
+    Licensed under the Apache License, Version 2.0.
+
+-------------------------------------------------------------------------------
+Other third-party software
+-------------------------------------------------------------------------------
+These are pulled in at build time via CMake FetchContent (not redistributed here):
+
+  - Apache Arrow nanoarrow  - Apache License 2.0  - https://github.com/apache/arrow-nanoarrow
+  - Zstandard (zstd)        - BSD-3-Clause        - https://github.com/facebook/zstd
+
+See THIRD-PARTY-LICENSES.md for details.
