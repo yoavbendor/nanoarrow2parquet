@@ -85,6 +85,30 @@ target_include_directories(nanoarrow2parquet PRIVATE
 target_link_libraries(nanoarrow2parquet PUBLIC nanoarrow_static PRIVATE ${N2P_ZSTD_TARGET})
 add_library(nanoarrow2parquet::nanoarrow2parquet ALIAS nanoarrow2parquet)
 
+# --- single-header amalgamation ---
+# The split sources above are the source of truth; single_include/ is generated
+# from them by scripts/amalgamate.py and committed so consumers can vendor one
+# file. `make n2p_amalgamate` regenerates it; the single-header test below keeps
+# it honest at build time.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+set(N2P_SINGLE_HEADER ${CMAKE_CURRENT_SOURCE_DIR}/single_include/nanoarrow2parquet.h)
+if(Python3_Interpreter_FOUND)
+    add_custom_target(n2p_amalgamate
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/scripts/amalgamate.py
+                -o ${N2P_SINGLE_HEADER}
+        BYPRODUCTS ${N2P_SINGLE_HEADER}
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        COMMENT "Regenerating single_include/nanoarrow2parquet.h")
+endif()
+
+# Header-only interface target for embedders who prefer the single header. They
+# still link nanoarrow + zstd (the implementation depends on both).
+add_library(nanoarrow2parquet_single INTERFACE)
+target_include_directories(nanoarrow2parquet_single INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/single_include>)
+add_library(nanoarrow2parquet::single ALIAS nanoarrow2parquet_single)
+
 if(N2P_BUILD_EXAMPLES)
     add_executable(arrow2parquet_demo examples/arrow2parquet_demo.cpp)
     target_link_libraries(arrow2parquet_demo PRIVATE nanoarrow2parquet nanoarrow_static)
@@ -96,6 +120,23 @@ if(N2P_BUILD_TESTS)
     target_include_directories(test_roundtrip PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(test_roundtrip PRIVATE nanoarrow2parquet nanoarrow_static)
     add_test(NAME test_roundtrip COMMAND test_roundtrip)
+
+    # Single-header build: two TUs share the amalgamated header (one defines the
+    # implementation macro), proving it compiles and links with no ODR clashes.
+    add_executable(test_single_header
+        tests/test_single_header.cpp
+        tests/test_single_header_decls.cpp)
+    target_link_libraries(test_single_header PRIVATE
+        nanoarrow2parquet::single nanoarrow_static ${N2P_ZSTD_TARGET})
+    add_test(NAME test_single_header COMMAND test_single_header)
+
+    # Keep the committed amalgamation in sync with the split sources.
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME amalgamation_up_to_date
+                 COMMAND ${Python3_EXECUTABLE}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/scripts/amalgamate.py
+                         -o ${N2P_SINGLE_HEADER} --check)
+    endif()
 
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
