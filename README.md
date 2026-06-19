@@ -88,6 +88,30 @@ char err[256];
 n2p_write_file("out.parquet", &schema, &batch, err, sizeof err);
 ```
 
+## Single-header build
+
+The library is also published as one self-contained, STB-style header at
+[`single_include/nanoarrow2parquet.h`](single_include/nanoarrow2parquet.h). Include
+it anywhere for the declarations; in **exactly one** translation unit define the
+implementation macro first:
+
+```cpp
+#define NANOARROW2PARQUET_IMPLEMENTATION
+#include "nanoarrow2parquet.h"     // brings in the writer implementation
+```
+
+Everywhere else, `#include "nanoarrow2parquet.h"` with no macro for just the C ABI.
+This is link-time equivalent to compiling `src/writer.cpp`: the header still needs
+the **nanoarrow** and **zstd** headers on the include path and links **libzstd**
+(use `N2P_CODEC_UNCOMPRESSED` if you want to avoid zstd at runtime). With CMake,
+link `nanoarrow2parquet::single` instead of the static library.
+
+The split files under `include/` and `src/` remain the source of truth; the single
+header is generated from them by [`scripts/amalgamate.py`](scripts/amalgamate.py)
+(`cmake --build build --target n2p_amalgamate`, or run the script directly). The
+`amalgamation_up_to_date` ctest fails if the committed header drifts from the
+sources.
+
 ## File layout
 
 ```
@@ -122,6 +146,10 @@ is pinned to the same commit nanolance uses. Embedding parents that already prov
 `ctest` runs:
 - `test_roundtrip` — unit checks of the compact-protocol encoder, the RLE/bit-pack
   encoder, file framing, and null rejection.
+- `test_single_header` — compiles two TUs against the amalgamated header (one
+  defining `NANOARROW2PARQUET_IMPLEMENTATION`) and writes a file, proving the
+  single-header build compiles and links with no ODR clashes.
+- `amalgamation_up_to_date` — asserts `single_include/` matches the split sources.
 - `smoke_pyarrow` — writes single-shot and 3-row-group files via the demo, then
   reads them back with pyarrow (and pandas/polars if installed) and asserts the
   values, dtypes, ZSTD codec, dictionary encoding, and row-group count.
