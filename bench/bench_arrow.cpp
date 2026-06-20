@@ -49,13 +49,19 @@ int main(int argc, char** argv) {
 
     // Import the shared schema once (consumes the C schema struct).
     ArrowSchema schema_c{};
-    bench::make_schema(&schema_c);
+    bench::make_schema(cfg, &schema_c);
     std::shared_ptr<arrow::Schema> schema =
         unwrap(arrow::ImportSchema(&schema_c), "ImportSchema");
 
-    // Writer properties: PLAIN (no dictionary), codec + level, one row group/chunk.
+    // Writer properties: numeric columns PLAIN (no dictionary) like n2p; string
+    // columns dictionary-encoded like n2p (which always RLE_DICTIONARYs strings).
+    // Codec + level matched, one row group per chunk.
     parquet::WriterProperties::Builder pb;
-    pb.disable_dictionary();
+    pb.disable_dictionary();                 // default off (numerics PLAIN)
+    if (cfg.strings) {
+        pb.enable_dictionary("level");       // match n2p's string path
+        pb.enable_dictionary("path");
+    }
     pb.max_row_group_length(static_cast<std::int64_t>(cfg.rows_per_chunk()));
     if (cfg.compress) {
         pb.compression(parquet::Compression::ZSTD);
@@ -74,11 +80,12 @@ int main(int argc, char** argv) {
 
     const std::uint64_t rows = cfg.rows_per_chunk();
     double gen_s = 0, write_s = 0;
+    std::uint64_t uncompressed = 0;
 
     for (std::uint64_t c = 0; c < cfg.num_chunks(); ++c) {
         ArrowArray batch_c{};
         auto t0 = bench::Clock::now();
-        bench::make_chunk_array(/*seed=*/c + 1, rows, &batch_c);
+        uncompressed += bench::make_chunk_array(cfg, /*seed=*/c + 1, rows, &batch_c);
         auto t1 = bench::Clock::now();
 
         // Zero-copy wrap + write one row group; rb releases the chunk at scope end.
@@ -95,7 +102,7 @@ int main(int argc, char** argv) {
     CHECK_OK(writer->Close(), "writer Close");
     CHECK_OK(sink->Close(), "sink Close");
 
-    bench::print_result({"arrow", cfg, gen_s, write_s,
+    bench::print_result({"arrow", cfg, cfg.total_rows(), uncompressed, gen_s, write_s,
                          bench::file_size(cfg.out.c_str()), bench::peak_rss_kb()});
     return 0;
 }

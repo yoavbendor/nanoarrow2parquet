@@ -17,7 +17,7 @@ int main(int argc, char** argv) {
     const bench::Config cfg = bench::parse_config(argc, argv, "/tmp/n2p_bench.parquet");
 
     ArrowSchema schema{};
-    bench::make_schema(&schema);
+    bench::make_schema(cfg, &schema);
 
     N2PWriter* w = nullptr;
     if (n2p_writer_open(&w, cfg.out.c_str()) != N2P_OK) {
@@ -33,11 +33,12 @@ int main(int argc, char** argv) {
 
     const std::uint64_t rows = cfg.rows_per_chunk();
     double gen_s = 0, write_s = 0;
+    std::uint64_t uncompressed = 0;
 
     for (std::uint64_t c = 0; c < cfg.num_chunks(); ++c) {
         ArrowArray batch{};
         auto t0 = bench::Clock::now();
-        bench::make_chunk_array(/*seed=*/c + 1, rows, &batch);
+        uncompressed += bench::make_chunk_array(cfg, /*seed=*/c + 1, rows, &batch);
         auto t1 = bench::Clock::now();
 
         int status = n2p_writer_write_batch(w, &schema, &batch);
@@ -60,7 +61,7 @@ int main(int argc, char** argv) {
     }
     if (schema.release) schema.release(&schema);
 
-    bench::print_result({"n2p", cfg, gen_s, write_s,
+    bench::print_result({"n2p", cfg, cfg.total_rows(), uncompressed, gen_s, write_s,
                          bench::file_size(cfg.out.c_str()), bench::peak_rss_kb()});
     return 0;
 }

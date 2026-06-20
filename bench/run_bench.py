@@ -30,14 +30,15 @@ import subprocess
 import sys
 
 
-def run_one(binary, total_mb, chunk_mb, codec, out_path, repeat):
+def run_one(binary, total_mb, chunk_mb, codec, strings, out_path, repeat):
     """Run a benchmark binary `repeat` times; return the result with the median
     write_s (data generation is excluded from the write timing by the binary)."""
     results = []
     for _ in range(repeat):
         proc = subprocess.run(
             [binary, "--total-mb", str(total_mb), "--chunk-mb", str(chunk_mb),
-             "--codec", codec, "--out", out_path],
+             "--codec", codec, "--strings" if strings else "--no-strings",
+             "--out", out_path],
             capture_output=True, text=True)
         if proc.returncode != 0:
             sys.stderr.write(proc.stdout + proc.stderr)
@@ -68,6 +69,8 @@ def main():
     ap.add_argument("--codecs", default="zstd,uncompressed", help="codecs (comma list)")
     ap.add_argument("--repeat", type=int, default=1, help="iterations per config (median write taken)")
     ap.add_argument("--out-dir", default="/tmp", help="scratch dir for output parquet files")
+    ap.add_argument("--no-strings", dest="strings", action="store_false",
+                    help="numeric-only columns (no dictionary-encoded strings)")
     ap.add_argument("--quick", action="store_true", help="tiny smoke matrix (200MB totals)")
     ap.add_argument("--json", default="", help="also write all raw results to this JSON file")
     args = ap.parse_args()
@@ -88,7 +91,9 @@ def main():
         sys.stderr.write(f"note: {ba} not found -- running n2p only (no Apache baseline)\n")
 
     free_gb = shutil.disk_usage(args.out_dir).free / 2**30
-    sys.stderr.write(f"scratch={args.out_dir} free={free_gb:.1f}GB  repeat={args.repeat}\n")
+    cols = "id,value,category,level,path" if args.strings else "id,value,category"
+    sys.stderr.write(f"scratch={args.out_dir} free={free_gb:.1f}GB repeat={args.repeat} "
+                     f"columns=[{cols}]\n")
 
     hdr = (f"{'total':>7} {'chunk':>6} {'codec':>12} {'lib':>6} "
            f"{'write_s':>9} {'write_GB/s':>11} {'Mrows/s':>9} {'file':>10} "
@@ -102,12 +107,12 @@ def main():
             if chunk > total:
                 continue
             for codec in codecs:
-                row_n = run_one(bn, total, chunk, codec,
+                row_n = run_one(bn, total, chunk, codec, args.strings,
                                 os.path.join(args.out_dir, "n2p_bench.parquet"), args.repeat)
                 raw.append(row_n)
                 rows = [("n2p", row_n)]
                 if have_arrow:
-                    row_a = run_one(ba, total, chunk, codec,
+                    row_a = run_one(ba, total, chunk, codec, args.strings,
                                     os.path.join(args.out_dir, "arrow_bench.parquet"), args.repeat)
                     raw.append(row_a)
                     rows.append(("arrow", row_a))

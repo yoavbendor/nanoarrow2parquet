@@ -10,9 +10,25 @@ dictionary disabled (PLAIN), fixed row-group sizing, file size reported.
 
 ## What it measures
 
-Schema: 3 columns — `id INT64`, `value DOUBLE`, `category INT32` (20 bytes/row),
-the same shape carquet uses. For each `(total, chunk, codec)` config, both writers
-process an **identical** stream of chunks:
+Schema (default, `--strings`) — a mix that exercises both write paths:
+
+| column | type | encoding | notes |
+|---|---|---|---|
+| `id` | int64 | PLAIN | fixed-width (near-memcpy) |
+| `value` | double | PLAIN | fixed-width |
+| `category` | int32 | PLAIN | fixed-width |
+| `level` | utf8 | **RLE_DICTIONARY** | 6 short categories (`INFO`/`WARN`/…), random per row |
+| `path` | utf8 | **RLE_DICTIONARY** | pool of 64 file-path-like strings, random per row |
+
+The two string columns are **low-cardinality and randomly spread across rows** —
+the case dictionary encoding exists for, and what real workloads (log levels, file
+paths, enum-ish categories) look like. n2p always dictionary-encodes strings; the
+Apache baseline is told to `enable_dictionary` on exactly those columns, so both
+emit RLE_DICTIONARY there and PLAIN for the numerics.
+
+Use `--no-strings` for the carquet-parity numeric-only schema (3 columns, no
+dictionary) — the pure fixed-width story. For each `(total, chunk, codec)` config,
+both writers process an **identical** stream of chunks:
 
 1. **gen** — a chunk of `chunk_mb` of columnar data is materialized into the Arrow
    C Data Interface (`bench_common.hpp::make_chunk_array`). Timed separately; this
@@ -32,7 +48,7 @@ match n2p's choices:
 
 | knob | setting | why |
 |---|---|---|
-| dictionary | **disabled** (PLAIN) | n2p uses PLAIN for fixed-width numeric columns |
+| dictionary | numerics off (PLAIN), strings on (RLE_DICTIONARY) | matches n2p: PLAIN fixed-width, dictionary for `utf8`/`binary` |
 | ZSTD level | **3** | matches n2p's hardcoded `compress_page` level |
 | row group | `max_row_group_length = rows_per_chunk` | one row group per chunk, like n2p |
 | codecs | `zstd`, `uncompressed` | the two n2p supports |
@@ -96,5 +112,8 @@ Each prints one JSON line: `gen_s`, `write_s`, `write_gbps`, `mrows_per_s`,
 - **Uncompressed**: n2p's fixed-width path is close to `memcpy`, so it tends to
   write faster than Arrow with near-zero size overhead (~20.00 B/row vs the 20 B
   of raw values).
+- **Strings (dictionary)**: with `level`/`path` drawn from small pools, both
+  writers emit RLE_DICTIONARY and land within ~0.1% on size; n2p's dictionary
+  builder keeps write speed on par with (often slightly ahead of) Arrow.
 - **Peak RSS** tracks the chunk size, not the dataset total — the point of the
   streaming design.
