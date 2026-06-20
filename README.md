@@ -187,6 +187,12 @@ At parity settings, ZSTD speed/size land within ~1% of Arrow (both bottleneck on
 zstd), while n2p's near-`memcpy` uncompressed path writes faster with near-zero
 size overhead and lower peak RSS.
 
+The same harness doubles as a **regression gate** (`run_bench.py --check`): it
+compares n2p to Apache Parquet C++ on the same runner and fails if write time or
+file size drifts beyond a ratio threshold — registered as the `bench_regression`
+CTest and run in CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) so new
+features / data types can't silently regress speed or size.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE), [NOTICE](NOTICE), and

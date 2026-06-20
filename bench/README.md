@@ -95,6 +95,38 @@ Each output file is deleted after measuring, so transient disk stays bounded by 
 single dataset (≤ the largest `--totals` entry). Use `--repeat N` to report the
 median write time across N iterations.
 
+## Regression gate (CI)
+
+`run_bench.py --check` turns the benchmark into a pass/fail gate that guards
+against performance and size regressions as new features / data types land:
+
+```sh
+python3 bench/run_bench.py --check --bin-dir build \
+    --totals 128 --chunks 64 --codecs zstd,uncompressed --repeat 3
+```
+
+It compares n2p against Apache Parquet C++ **on the same machine at the same
+moment**, so it asserts *ratios*, not absolute throughput — stable even on noisy
+shared CI runners. It fails (exit 1) if, for any config:
+
+- `n2p write_s > arrow write_s * --max-write-ratio` (default 2.5 — generous; n2p
+  is normally faster or on par), or
+- `n2p file_bytes > arrow file_bytes * --max-size-ratio` (default 1.10), or
+- row counts disagree / n2p emits an empty file.
+
+This runs two ways:
+
+- **CTest** — registered as `bench_regression` when built with
+  `-DN2P_BUILD_TESTS=ON -DN2P_BUILD_BENCHMARKS=ON`; a few-second 128 MB matrix, so
+  `ctest` covers it alongside the correctness tests.
+- **GitHub Actions** — [`.github/workflows/ci.yml`](../.github/workflows/ci.yml)
+  builds everything, runs `ctest`, then runs a larger 1 GB report (`--json`) and
+  uploads `bench-report.txt` / `bench-results.json` as an artifact so each PR shows
+  write speed and file size next to Arrow.
+
+Tighten the thresholds (e.g. `--max-write-ratio 1.3`) once you have a feel for the
+runner's variance, to catch smaller regressions.
+
 ## Direct binary use
 
 ```sh

@@ -72,6 +72,14 @@ def main():
     ap.add_argument("--no-strings", dest="strings", action="store_false",
                     help="numeric-only columns (no dictionary-encoded strings)")
     ap.add_argument("--quick", action="store_true", help="tiny smoke matrix (200MB totals)")
+    ap.add_argument("--check", action="store_true",
+                    help="regression gate: assert n2p stays competitive with Arrow on the "
+                         "same runner; exit nonzero on violation (requires bench_arrow)")
+    ap.add_argument("--max-size-ratio", type=float, default=1.10,
+                    help="fail if n2p file_bytes > arrow file_bytes * this (default 1.10)")
+    ap.add_argument("--max-write-ratio", type=float, default=2.5,
+                    help="fail if n2p write_s > arrow write_s * this (default 2.5; generous "
+                         "for CI noise -- it compares two libs on the same machine)")
     ap.add_argument("--json", default="", help="also write all raw results to this JSON file")
     args = ap.parse_args()
 
@@ -88,6 +96,9 @@ def main():
         raise SystemExit(f"missing {bn}; build with -DN2P_BUILD_BENCHMARKS=ON")
     have_arrow = os.path.exists(ba)
     if not have_arrow:
+        if args.check:
+            raise SystemExit(f"--check needs the Apache baseline ({ba}); build it with "
+                             "pyarrow installed (-DN2P_BUILD_BENCHMARKS=ON)")
         sys.stderr.write(f"note: {ba} not found -- running n2p only (no Apache baseline)\n")
 
     free_gb = shutil.disk_usage(args.out_dir).free / 2**30
@@ -102,6 +113,7 @@ def main():
     print("-" * len(hdr))
 
     raw = []
+    failures = []
     for total in totals:
         for chunk in chunks:
             if chunk > total:
@@ -128,12 +140,37 @@ def main():
                     faster = "faster" if spd >= 1 else "slower"
                     print(f"{'':>7} {'':>6} {codec:>12} {'ratio':>6} "
                           f"  n2p write {spd:.2f}x ({faster}),  n2p file {size:.3f}x arrow")
+                    if args.check:
+                        cfg = f"total={total}M chunk={chunk}M {codec} strings={args.strings}"
+                        # write_s ratio: n2p time vs arrow time (>1 means n2p slower).
+                        wr = row_n["write_s"] / row_a["write_s"] if row_a["write_s"] else 0
+                        if wr > args.max_write_ratio:
+                            failures.append(f"WRITE  {cfg}: n2p {wr:.2f}x arrow time "
+                                            f"(> {args.max_write_ratio})")
+                        if size > args.max_size_ratio:
+                            failures.append(f"SIZE   {cfg}: n2p file {size:.3f}x arrow "
+                                            f"(> {args.max_size_ratio})")
+                        if row_n["rows"] != row_a["rows"]:
+                            failures.append(f"ROWS   {cfg}: n2p {row_n['rows']} != arrow {row_a['rows']}")
+                        if row_n["file_bytes"] == 0:
+                            failures.append(f"EMPTY  {cfg}: n2p produced an empty file")
                 print()
 
     if args.json:
         with open(args.json, "w") as f:
             json.dump(raw, f, indent=2)
         sys.stderr.write(f"wrote raw results to {args.json}\n")
+
+    if args.check:
+        if failures:
+            print("\nREGRESSION CHECK: FAIL")
+            for f in failures:
+                print(f"  - {f}")
+            print(f"\nthresholds: write <= {args.max_write_ratio}x arrow time, "
+                  f"size <= {args.max_size_ratio}x arrow")
+            raise SystemExit(1)
+        print("\nREGRESSION CHECK: PASS "
+              f"(write <= {args.max_write_ratio}x arrow time, size <= {args.max_size_ratio}x)")
 
 
 if __name__ == "__main__":

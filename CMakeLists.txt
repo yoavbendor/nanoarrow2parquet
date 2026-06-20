@@ -204,4 +204,16 @@ if(N2P_BUILD_TESTS)
                          PYTHON=${Python3_EXECUTABLE}
                          bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke_pyarrow_roundtrip.sh)
     endif()
+
+    # Performance/size regression gate vs Apache Parquet C++. Only registered when
+    # the benchmarks are built (-DN2P_BUILD_BENCHMARKS=ON, which needs the Apache
+    # baseline). Compares the two writers on the same machine, so the ratios are
+    # stable under CI noise; a small fast matrix keeps it to a few seconds.
+    if(Python3_Interpreter_FOUND AND TARGET bench_n2p AND TARGET bench_arrow)
+        add_test(NAME bench_regression
+                 COMMAND ${Python3_EXECUTABLE}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/bench/run_bench.py --check
+                         --bin-dir ${CMAKE_CURRENT_BINARY_DIR}
+                         --totals 128 --chunks 64 --codecs zstd,uncompressed --repeat 3)
+    endif()
 endif()
