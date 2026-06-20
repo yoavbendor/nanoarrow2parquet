@@ -204,6 +204,10 @@ if(N2P_BUILD_TESTS)
     add_executable(test_struct tests/test_struct.cpp)
     target_link_libraries(test_struct PRIVATE nanoarrow2parquet nanoarrow_static)
 
+    # BYTE_ARRAY encoding chooser: PLAIN fallback vs RLE_DICTIONARY.
+    add_executable(test_strings tests/test_strings.cpp)
+    target_link_libraries(test_strings PRIVATE nanoarrow2parquet nanoarrow_static)
+
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
         add_test(NAME smoke_pyarrow
@@ -223,6 +227,12 @@ if(N2P_BUILD_TESTS)
                      "$<TARGET_FILE:test_struct> ${CMAKE_CURRENT_BINARY_DIR}/n2p_structs.parquet && \
                       ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_struct.py \
                       ${CMAKE_CURRENT_BINARY_DIR}/n2p_structs.parquet")
+
+        add_test(NAME strings_roundtrip
+                 COMMAND bash -c
+                     "$<TARGET_FILE:test_strings> ${CMAKE_CURRENT_BINARY_DIR}/n2p_strings.parquet && \
+                      ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_strings.py \
+                      ${CMAKE_CURRENT_BINARY_DIR}/n2p_strings.parquet")
     endif()
 
     # Performance/size regression gate vs Apache Parquet C++. Only registered when

@@ -750,16 +750,22 @@ std::vector<std::uint8_t> build_plain_bool(const ArrowArray& arr, const std::uin
     return body;
 }
 
-// Build the dictionary (PLAIN BYTE_ARRAY) page body and the RLE_DICTIONARY data
-// page body for a string/binary column.
-struct DictPages {
+// Build the page body for a string/binary column, choosing between
+// RLE_DICTIONARY and PLAIN BYTE_ARRAY encoding. Dictionary encoding wins when
+// values repeat; it is pathological for high-cardinality columns (unique ids,
+// free text), where the dictionary holds every value once *plus* an index per
+// row. We build the dictionary, then compare its encoded size against a PLAIN
+// (4-byte length + bytes per present value) layout and keep the smaller. When
+// PLAIN wins `use_dictionary` is false and only `data_body` is populated.
+struct ByteArrayPages {
+    bool use_dictionary = true;
     std::vector<std::uint8_t> dict_body;
     std::vector<std::uint8_t> data_body;
     std::size_t dict_size = 0;
 };
 
-DictPages build_dictionary_pages(const ArrowArray& arr, const ColumnSpec& s,
-                                 const std::uint8_t* validity) {
+ByteArrayPages build_byte_array_pages(const ArrowArray& arr, const ColumnSpec& s,
+                                      const std::uint8_t* validity) {
     const auto n = static_cast<std::size_t>(arr.length);
     const auto* data = static_cast<const std::uint8_t*>(arr.buffers[2]);
 
@@ -776,15 +782,20 @@ DictPages build_dictionary_pages(const ArrowArray& arr, const ColumnSpec& s,
                                 static_cast<std::size_t>(end - start));
     };
 
-    // Indices are emitted only for present rows (nulls are carried by the def
-    // levels), so this vector may be shorter than `n`.
+    // Present rows only: nulls are carried by the def levels, so `present` /
+    // `indices` may be shorter than `n`.
     std::unordered_map<std::string_view, std::uint32_t> seen;
     std::vector<std::string_view> dict;
+    std::vector<std::string_view> present;
     std::vector<std::uint32_t> indices;
     indices.reserve(n);
+    present.reserve(n);
+    std::size_t value_bytes = 0;  // total bytes of present values (PLAIN payload)
     for (std::size_t i = 0; i < n; ++i) {
         if (!valid_bit(validity, i)) continue;
         const std::string_view v = value_at(i);
+        present.push_back(v);
+        value_bytes += v.size();
         auto it = seen.find(v);
         if (it == seen.end()) {
             const auto idx = static_cast<std::uint32_t>(dict.size());
@@ -796,16 +807,36 @@ DictPages build_dictionary_pages(const ArrowArray& arr, const ColumnSpec& s,
         }
     }
 
-    DictPages out;
+    // Encoded size of the dictionary layout: dictionary page (4 + len per
+    // distinct value) plus the RLE-encoded index stream (bit-width byte + body).
+    std::size_t dict_body_bytes = 4 * dict.size();
+    for (std::string_view v : dict) dict_body_bytes += v.size();
+    const int bit_width = dictionary_bit_width(dict.size());
+    auto idx_encoded = encode_rle_dictionary_indices(indices, bit_width);
+    const std::size_t dict_total = dict_body_bytes + 1 + idx_encoded.size();
+    // Encoded size of PLAIN: 4-byte length prefix + bytes for each present value.
+    const std::size_t plain_total = 4 * present.size() + value_bytes;
+
+    ByteArrayPages out;
+    if (plain_total < dict_total) {
+        out.use_dictionary = false;
+        out.data_body.reserve(plain_total);
+        for (std::string_view v : present) {
+            append_le(out.data_body, static_cast<std::uint32_t>(v.size()));
+            out.data_body.insert(out.data_body.end(), v.begin(), v.end());
+        }
+        return out;
+    }
+
+    out.use_dictionary = true;
     out.dict_size = dict.size();
+    out.dict_body.reserve(dict_body_bytes);
     for (std::string_view v : dict) {
         append_le(out.dict_body, static_cast<std::uint32_t>(v.size()));
         out.dict_body.insert(out.dict_body.end(), v.begin(), v.end());
     }
-    const int bit_width = dictionary_bit_width(dict.size());
     out.data_body.push_back(static_cast<std::uint8_t>(bit_width));
-    auto encoded = encode_rle_dictionary_indices(indices, bit_width);
-    out.data_body.insert(out.data_body.end(), encoded.begin(), encoded.end());
+    out.data_body.insert(out.data_body.end(), idx_encoded.begin(), idx_encoded.end());
     return out;
 }
 
@@ -1115,29 +1146,45 @@ int write_one_batch(N2PWriter& w, const ArrowSchema* schema, const ArrowArray* b
             }
 
             if (s.extract == Extract::ByteArray) {
-                DictPages pages = build_dictionary_pages(*child, s, value_validity);
-                // dictionary page
-                auto dict_comp = compress_page(pages.dict_body, w.codec);
-                auto dict_hdr = dictionary_page_header(
-                    static_cast<std::int32_t>(pages.dict_size),
-                    static_cast<std::int32_t>(pages.dict_body.size()),
-                    static_cast<std::int32_t>(dict_comp.size()));
-                c.dictionary_page_offset = w.offset;
-                c.has_dictionary = true;
-                PageBytes dp = emit_page(w, dict_hdr, dict_comp, pages.dict_body.size());
-                // data page (RLE_DICTIONARY), def levels first.
-                std::vector<std::uint8_t> data_body = def_prefix;
-                data_body.insert(data_body.end(), pages.data_body.begin(), pages.data_body.end());
-                auto data_comp = compress_page(data_body, w.codec);
-                auto data_hdr = data_page_header(
-                    static_cast<std::int32_t>(batch->length), pq::Encoding::RleDictionary,
-                    static_cast<std::int32_t>(data_body.size()),
-                    static_cast<std::int32_t>(data_comp.size()));
-                c.data_page_offset = w.offset;
-                PageBytes vp = emit_page(w, data_hdr, data_comp, data_body.size());
-                c.total_uncompressed = dp.uncompressed + vp.uncompressed;
-                c.total_compressed = dp.on_disk + vp.on_disk;
-                c.encodings = {pq::Encoding::Plain, pq::Encoding::RleDictionary};
+                ByteArrayPages pages = build_byte_array_pages(*child, s, value_validity);
+                if (pages.use_dictionary) {
+                    // dictionary page
+                    auto dict_comp = compress_page(pages.dict_body, w.codec);
+                    auto dict_hdr = dictionary_page_header(
+                        static_cast<std::int32_t>(pages.dict_size),
+                        static_cast<std::int32_t>(pages.dict_body.size()),
+                        static_cast<std::int32_t>(dict_comp.size()));
+                    c.dictionary_page_offset = w.offset;
+                    c.has_dictionary = true;
+                    PageBytes dp = emit_page(w, dict_hdr, dict_comp, pages.dict_body.size());
+                    // data page (RLE_DICTIONARY), def levels first.
+                    std::vector<std::uint8_t> data_body = def_prefix;
+                    data_body.insert(data_body.end(), pages.data_body.begin(), pages.data_body.end());
+                    auto data_comp = compress_page(data_body, w.codec);
+                    auto data_hdr = data_page_header(
+                        static_cast<std::int32_t>(batch->length), pq::Encoding::RleDictionary,
+                        static_cast<std::int32_t>(data_body.size()),
+                        static_cast<std::int32_t>(data_comp.size()));
+                    c.data_page_offset = w.offset;
+                    PageBytes vp = emit_page(w, data_hdr, data_comp, data_body.size());
+                    c.total_uncompressed = dp.uncompressed + vp.uncompressed;
+                    c.total_compressed = dp.on_disk + vp.on_disk;
+                    c.encodings = {pq::Encoding::Plain, pq::Encoding::RleDictionary};
+                } else {
+                    // PLAIN BYTE_ARRAY data page, def levels first.
+                    std::vector<std::uint8_t> data_body = def_prefix;
+                    data_body.insert(data_body.end(), pages.data_body.begin(), pages.data_body.end());
+                    auto data_comp = compress_page(data_body, w.codec);
+                    auto data_hdr = data_page_header(
+                        static_cast<std::int32_t>(batch->length), pq::Encoding::Plain,
+                        static_cast<std::int32_t>(data_body.size()),
+                        static_cast<std::int32_t>(data_comp.size()));
+                    c.data_page_offset = w.offset;
+                    PageBytes vp = emit_page(w, data_hdr, data_comp, data_body.size());
+                    c.total_uncompressed = vp.uncompressed;
+                    c.total_compressed = vp.on_disk;
+                    c.encodings = {pq::Encoding::Plain};
+                }
             } else {
                 std::vector<std::uint8_t> body = def_prefix;
                 if (s.extract == Extract::Bool) {

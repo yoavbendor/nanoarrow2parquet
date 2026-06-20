@@ -13,8 +13,9 @@ representation, so it controls the complexity:
 - For PLAIN-encoded, uncompressed, fixed-width columns the Parquet data-page body
   is **byte-identical to the Arrow values buffer** — the column data path is
   essentially a `memcpy`.
-- Strings are stored with **dictionary encoding** (the standard, best-compressing
-  representation), which also handles deduplication.
+- Strings pick their encoding **per column**: dictionary (`RLE_DICTIONARY`,
+  dedup + best compression) when values repeat, falling back to `PLAIN` when the
+  data is high-cardinality and the dictionary would be larger than the raw bytes.
 - Every page body is **compressed** (ZSTD by default).
 
 The only real format work is a small Thrift *compact protocol* encoder
@@ -27,8 +28,9 @@ The only real format work is a small Thrift *compact protocol* encoder
 
 - Fixed-width flat columns: `int8/16/32/64`, `uint8/16/32/64`, `float`, `double`,
   `bool`, `fixed_size_binary(N)` — PLAIN.
-- Variable-width strings/binary (`utf8`, `large_utf8`, `binary`, `large_binary`)
-  via dictionary encoding (`RLE_DICTIONARY`).
+- Variable-width strings/binary (`utf8`, `large_utf8`, `binary`, `large_binary`):
+  dictionary-encoded (`RLE_DICTIONARY`) when it shrinks the column, otherwise
+  `PLAIN` BYTE_ARRAY — chosen automatically per column.
 - **Nullable (OPTIONAL) columns**: a column whose Arrow schema sets
   `ARROW_FLAG_NULLABLE` is written with definition levels (only present values are
   stored); the Arrow null type (`n`) becomes an all-null column. Non-nullable
@@ -49,7 +51,7 @@ so the same Arrow data feeds either writer (Parquet or Lance).
 | `I` `L` | INT32 / INT64 + `UINT_*` | bits identical ⇒ memcpy |
 | `c` `s` `C` `S` | INT32 + `INT_8/16` / `UINT_8/16` | widened 1/2 → 4 bytes |
 | `w:N` | FIXED_LEN_BYTE_ARRAY (`type_length=N`) | memcpy |
-| `u` `U` `z` `Z` | BYTE_ARRAY via dictionary | `RLE_DICTIONARY` data page |
+| `u` `U` `z` `Z` | BYTE_ARRAY | `RLE_DICTIONARY` or `PLAIN`, chosen per column by size |
 | `n` | all-null INT32 | OPTIONAL, every value null |
 | `+s` | group (struct) | nested, recurses to leaf columns |
 | any nullable | + definition levels | OPTIONAL repetition, present values only |
