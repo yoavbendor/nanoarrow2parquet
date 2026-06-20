@@ -19,9 +19,14 @@
 // exactly one row group, so batching policy stays with the caller (the producer
 // knows its natural chunk size; the writer never buffers the whole dataset).
 //
-// Scope (v0): REQUIRED fixed-width numeric columns (int8/16/32/64, uint8/16/32/64,
-// float, double). Nullable columns, strings/binary, and nested structs are not
-// yet reachable from this path -- use the ArrowArray C API for those.
+// Nullable columns: declare the field with Nullable<"name", T> and pass the
+// column wrapped in present(values, mask) -- a per-element presence mask that is
+// packed into an Arrow validity bitmap -- or valid_bits(values, bitmap, nulls)
+// to alias a pre-packed LSB-first bitmap with no copy.
+//
+// Scope: REQUIRED or OPTIONAL fixed-width numeric columns (int8/16/32/64,
+// uint8/16/32/64, float, double). Strings/binary and nested structs are not yet
+// reachable from this path -- use the ArrowArray C API for those.
 
 #include "nanoarrow2parquet/nanoarrow2parquet.h"
 
@@ -34,6 +39,7 @@
 #include <tuple>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 // Arrow C Data Interface structs, defined under the standard guard so this header
 // can coexist with nanoarrow.h (identical layout -> ABI-compatible). We only fill
@@ -115,11 +121,64 @@ struct fixed_string {
 template <std::size_t N>
 fixed_string(const char (&)[N]) -> fixed_string<N>;
 
-template <fixed_string Name, class T>
+template <fixed_string Name, class T, bool Nullable = false>
 struct Field {
     static constexpr auto name = Name;
     using type = T;
+    static constexpr bool nullable = Nullable;
 };
+
+// Declares an OPTIONAL column; supply it via present(...) or valid_bits(...).
+template <fixed_string Name, class T>
+using Nullable = Field<Name, T, true>;
+
+// ---- nullable column wrappers --------------------------------------------
+
+// A values range paired with an Arrow validity bitmap. `owned_bitmap` holds a
+// bitmap we packed (from a presence mask); when empty, `bitmap` aliases a caller
+// buffer with no copy. A null `bitmap` means "all present".
+template <class Values>
+struct nullable_column {
+    using soa_nullable_column = void;  // tag for is_nullable_col
+    const Values& values;
+    std::vector<std::uint8_t> owned_bitmap;
+    const std::uint8_t* bitmap;
+    std::int64_t null_count;
+
+    const std::uint8_t* validity() const {
+        return owned_bitmap.empty() ? bitmap : owned_bitmap.data();
+    }
+};
+
+template <class T, class = void>
+struct is_nullable_col : std::false_type {};
+template <class T>
+struct is_nullable_col<T, std::void_t<typename T::soa_nullable_column>> : std::true_type {};
+
+// Wrap a column with a per-element presence mask (truthy element == present, not
+// null). The mask is packed into an Arrow LSB-first validity bitmap.
+template <class Values, class Mask>
+nullable_column<Values> present(const Values& values, const Mask& mask) {
+    const std::size_t n = std::ranges::size(values);
+    std::vector<std::uint8_t> bits((n + 7) / 8, 0);
+    std::int64_t nulls = 0;
+    std::size_t i = 0;
+    for (auto&& m : mask) {
+        if (i >= n) break;
+        if (static_cast<bool>(m)) bits[i >> 3] |= static_cast<std::uint8_t>(1u << (i & 7));
+        else ++nulls;
+        ++i;
+    }
+    return nullable_column<Values>{values, std::move(bits), nullptr, nulls};
+}
+
+// Wrap a column with a pre-packed LSB-first validity bitmap (1 == present). No
+// copy: the bitmap is aliased. `bitmap == nullptr` means all present.
+template <class Values>
+nullable_column<Values> valid_bits(const Values& values, const std::uint8_t* bitmap,
+                                   std::int64_t null_count) {
+    return nullable_column<Values>{values, {}, bitmap, null_count};
+}
 
 // ---- contiguous-column helpers -------------------------------------------
 
@@ -163,9 +222,10 @@ public:
         return static_cast<N2PStatus>(n2p_writer_set_codec(w_, codec));
     }
 
-    // Write one row group from one contiguous range per field, in field order.
-    // Column element types are checked against the schema at compile time; equal
-    // row counts are checked at runtime (a row group must be rectangular).
+    // Write one row group from one column per field, in field order. REQUIRED
+    // fields take a plain contiguous range; Nullable fields take present(...) or
+    // valid_bits(...). Element types are checked at compile time; equal row
+    // counts are checked at runtime (a row group must be rectangular).
     template <class... Cols>
     N2PStatus write_chunk(const Cols&... cols) {
         static_assert(sizeof...(Cols) == K, "column count must match the schema");
@@ -181,11 +241,19 @@ public:
     }
 
 private:
+    template <class Arg>
+    static std::size_t row_count(const Arg& arg) {
+        if constexpr (is_nullable_col<std::remove_cvref_t<Arg>>::value)
+            return std::ranges::size(arg.values);
+        else
+            return std::ranges::size(arg);
+    }
+
     template <std::size_t... I, class... Cols>
     N2PStatus write_chunk_impl(std::index_sequence<I...>, const Cols&... cols) {
         if (!w_) return status_;
 
-        const std::size_t sizes[K] = {std::ranges::size(cols)...};
+        const std::size_t sizes[K] = {row_count(cols)...};
         for (std::size_t i = 1; i < K; ++i) {
             if (sizes[i] != sizes[0]) {
                 status_ = N2P_INVALID_ARGUMENT;
@@ -204,13 +272,34 @@ private:
         auto setup = [&]<std::size_t J, class Col>(std::integral_constant<std::size_t, J>,
                                                    const Col& col) {
             using F = field_at<J>;
-            static_assert(std::same_as<column_value_t<Col>, typename F::type>,
+            using FT = typename F::type;
+            constexpr bool arg_nullable = is_nullable_col<std::remove_cvref_t<Col>>::value;
+            static_assert(F::nullable == arg_nullable,
+                          "Nullable<> fields need present()/valid_bits(); "
+                          "required fields take a plain range");
+
+            const std::uint8_t* validity = nullptr;
+            std::int64_t null_count = 0;
+            auto get_values = [&]() -> const auto& {
+                if constexpr (arg_nullable) return col.values;
+                else return col;
+            };
+            const auto& values = get_values();
+            if constexpr (arg_nullable) {
+                validity = col.validity();
+                null_count = col.null_count;
+            }
+
+            static_assert(std::same_as<column_value_t<decltype(values)>, FT>,
                           "SoA column element type does not match its field type");
-            cs[J].format = arrow_traits<typename F::type>::format;
+
+            cs[J].format = arrow_traits<FT>::format;
             cs[J].name = F::name.c_str();
-            cb[J][0] = nullptr;                                        // validity (all valid)
-            cb[J][1] = static_cast<const void*>(std::ranges::data(col));
+            cs[J].flags = F::nullable ? ARROW_FLAG_NULLABLE : 0;
+            cb[J][0] = validity;                                          // validity bitmap
+            cb[J][1] = static_cast<const void*>(std::ranges::data(values));
             ca[J].length = n;
+            ca[J].null_count = null_count;
             ca[J].n_buffers = 2;
             ca[J].buffers = cb[J];
             csp[J] = &cs[J];

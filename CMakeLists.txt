@@ -213,6 +213,9 @@ if(N2P_BUILD_TESTS)
     add_executable(test_soa tests/test_soa.cpp)
     target_link_libraries(test_soa PRIVATE nanoarrow2parquet)
 
+    add_executable(test_soa_nullable tests/test_soa_nullable.cpp)
+    target_link_libraries(test_soa_nullable PRIVATE nanoarrow2parquet)
+
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
         add_test(NAME smoke_pyarrow
@@ -244,6 +247,12 @@ if(N2P_BUILD_TESTS)
                      "$<TARGET_FILE:test_soa> ${CMAKE_CURRENT_BINARY_DIR}/n2p_soa.parquet && \
                       ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_soa.py \
                       ${CMAKE_CURRENT_BINARY_DIR}/n2p_soa.parquet")
+
+        add_test(NAME soa_nullable_roundtrip
+                 COMMAND bash -c
+                     "$<TARGET_FILE:test_soa_nullable> ${CMAKE_CURRENT_BINARY_DIR}/n2p_soa_nullable.parquet && \
+                      ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_soa_nullable.py \
+                      ${CMAKE_CURRENT_BINARY_DIR}/n2p_soa_nullable.parquet")
     endif()
 
     # Performance/size regression gate vs Apache Parquet C++. Only registered when
