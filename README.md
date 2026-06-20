@@ -33,6 +33,10 @@ The only real format work is a small Thrift *compact protocol* encoder
   `ARROW_FLAG_NULLABLE` is written with definition levels (only present values are
   stored); the Arrow null type (`n`) becomes an all-null column. Non-nullable
   columns keep the zero-overhead REQUIRED fast path and reject actual nulls.
+- **Nested struct columns** (`+s`), arbitrarily deep, nullable or required — each
+  leaf carries its dotted `path_in_schema` and multi-level definition levels (so a
+  null can come from the leaf *or* any ancestor struct). This is the Parquet analog
+  of nanolance's grouped/blob.v2 columns.
 - Per-page compression: ZSTD (default) or uncompressed.
 - One or more row groups via the streaming writer.
 
@@ -47,10 +51,11 @@ so the same Arrow data feeds either writer (Parquet or Lance).
 | `w:N` | FIXED_LEN_BYTE_ARRAY (`type_length=N`) | memcpy |
 | `u` `U` `z` `Z` | BYTE_ARRAY via dictionary | `RLE_DICTIONARY` data page |
 | `n` | all-null INT32 | OPTIONAL, every value null |
+| `+s` | group (struct) | nested, recurses to leaf columns |
 | any nullable | + definition levels | OPTIONAL repetition, present values only |
 
-**Out of scope (TODO):** nested list/struct/map columns, page statistics /
-indexes, bloom filters, `DELTA_*` / `BYTE_STREAM_SPLIT` encodings.
+**Out of scope (TODO):** nested list/map columns (repetition levels), page
+statistics / indexes, bloom filters, `DELTA_*` / `BYTE_STREAM_SPLIT` encodings.
 
 ## API
 

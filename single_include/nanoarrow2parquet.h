@@ -36,11 +36,13 @@
 //     ARROW_FLAG_NULLABLE is written with definition levels; the Arrow null
 //     type ("n") becomes an all-null column. REQUIRED columns (non-nullable
 //     schema) keep the zero-overhead fast path and reject actual nulls.
+//   * nested struct columns ("+s"), arbitrarily deep, nullable or required --
+//     each leaf carries its dotted path and multi-level definition levels.
 //   * every page body is compressed (ZSTD by default).
 //   * one or more row groups (streaming writer).
 //
-// Out of scope (documented TODO): nested list/struct/map columns, page
-// statistics / indexes, bloom filters.
+// Out of scope (documented TODO): nested list/map columns (repetition levels),
+// page statistics / indexes, bloom filters.
 
 #include <stddef.h>
 
@@ -582,12 +584,86 @@ std::optional<ColumnSpec> map_format(const char* format, std::string name,
     return std::nullopt;
 }
 
+// ---- nested schema flattening --------------------------------------------
+//
+// A record batch is a tree of struct groups and leaf columns. Parquet stores it
+// as a pre-order list of SchemaElements (groups declare num_children) and one
+// column chunk per leaf, where each leaf carries its full dotted path and a
+// max definition level equal to the number of OPTIONAL nodes on its path.
+
+struct SchemaNode {
+    bool is_group = false;
+    std::string name;
+    bool optional = false;
+    int num_children = 0;          // groups only
+    pq::Type type{};               // leaves only
+    bool has_converted = false;
+    pq::ConvertedType converted{};
+    int type_length = 0;
+};
+
+struct LeafSpec {
+    ColumnSpec col;
+    std::vector<int> path_idx;          // child indices from the root to the leaf
+    std::vector<std::string> path_names;
+    std::vector<bool> path_optional;    // OPTIONAL flag per node on the path
+    int max_def_level = 0;              // = count(path_optional == true)
+    int def_bit_width = 0;
+};
+
+// Recursively flatten a schema child (struct group or leaf). `idx/names/opt`
+// already include this node. Appends to `nodes` (footer, pre-order) and, for
+// leaves, to `leaves` (write order).
+bool flatten_schema(const ArrowSchema* node, std::vector<int> idx,
+                    std::vector<std::string> names, std::vector<bool> opt,
+                    std::vector<SchemaNode>& nodes, std::vector<LeafSpec>& leaves,
+                    std::string& err) {
+    const bool nullable = (node->flags & ARROW_FLAG_NULLABLE) != 0;
+    if (node->format != nullptr && std::strcmp(node->format, "+s") == 0) {
+        SchemaNode g;
+        g.is_group = true;
+        g.name = node->name ? node->name : "";
+        g.optional = nullable;
+        g.num_children = static_cast<int>(node->n_children);
+        nodes.push_back(g);
+        for (std::int64_t i = 0; i < node->n_children; ++i) {
+            const ArrowSchema* child = node->children[i];
+            const bool child_null = (child->flags & ARROW_FLAG_NULLABLE) != 0 ||
+                                    (child->format && std::strcmp(child->format, "n") == 0);
+            auto idx2 = idx; idx2.push_back(static_cast<int>(i));
+            auto names2 = names; names2.push_back(child->name ? child->name : "");
+            auto opt2 = opt; opt2.push_back(child_null);
+            if (!flatten_schema(child, idx2, names2, opt2, nodes, leaves, err)) return false;
+        }
+        return true;
+    }
+    // leaf
+    auto spec = map_format(node->format, node->name ? node->name : "", nullable, err);
+    if (!spec) return false;
+    SchemaNode ln;
+    ln.name = spec->name; ln.optional = spec->nullable; ln.type = spec->type;
+    ln.has_converted = spec->has_converted; ln.converted = spec->converted;
+    ln.type_length = spec->type_length;
+    nodes.push_back(ln);
+    LeafSpec leaf;
+    leaf.col = std::move(*spec);
+    leaf.path_idx = std::move(idx);
+    leaf.path_names = std::move(names);
+    leaf.path_optional = opt;
+    int D = 0;
+    for (bool o : opt) if (o) ++D;
+    leaf.max_def_level = D;
+    leaf.def_bit_width = dictionary_bit_width(static_cast<std::size_t>(D) + 1);
+    leaves.push_back(std::move(leaf));
+    return true;
+}
+
 // ---- per-chunk metadata captured while streaming pages --------------------
 
 struct ColumnChunkMeta {
     pq::Type type{};
     std::vector<pq::Encoding> encodings;
-    std::string name;
+    std::vector<std::string> path;  // path_in_schema (dotted column path)
     std::int64_t num_values = 0;
     std::int64_t total_uncompressed = 0;
     std::int64_t total_compressed = 0;
@@ -672,15 +748,6 @@ std::vector<std::uint8_t> build_plain_bool(const ArrowArray& arr, const std::uin
         ++out_bit;
     }
     return body;
-}
-
-// Definition levels for a flat OPTIONAL column: 1 = present, 0 = null.
-std::vector<std::uint8_t> build_def_levels(const std::uint8_t* validity, std::size_t n,
-                                           bool all_null = false) {
-    std::vector<std::uint32_t> levels(n);
-    for (std::size_t i = 0; i < n; ++i)
-        levels[i] = (all_null || !valid_bit(validity, i)) ? 0u : 1u;
-    return encode_definition_levels(levels, /*bit_width=*/1);
 }
 
 // Build the dictionary (PLAIN BYTE_ARRAY) page body and the RLE_DICTIONARY data
@@ -793,7 +860,9 @@ struct N2PWriter {
     std::int64_t offset = 0;
     n2p::pq::Codec codec = n2p::pq::Codec::Zstd;
     bool schema_locked = false;
-    std::vector<n2p::ColumnSpec> columns;
+    std::vector<n2p::SchemaNode> schema_nodes;  // pre-order, for the footer schema
+    std::vector<n2p::LeafSpec> leaves;          // one column chunk per leaf
+    int top_children = 0;                        // direct children of the root struct
     std::vector<n2p::RowGroupMeta> row_groups;
     std::int64_t total_rows = 0;
     bool footer_written = false;
@@ -849,17 +918,25 @@ bool validate_child(const ArrowArray& child, const ColumnSpec& s,
     return true;
 }
 
-void serialize_schema_element(CompactWriter& w, const ColumnSpec& s) {
+void serialize_schema_element(CompactWriter& w, const SchemaNode& s) {
     w.begin_struct_element();
-    w.field_i32(1, static_cast<std::int32_t>(s.type));
-    if (s.type == pq::Type::FixedLenByteArray) {
-        w.field_i32(2, s.type_length);
-    }
-    w.field_i32(3, static_cast<std::int32_t>(s.nullable ? pq::Repetition::Optional
-                                                        : pq::Repetition::Required));
-    w.field_string(4, s.name);
-    if (s.has_converted) {
-        w.field_i32(6, static_cast<std::int32_t>(s.converted));
+    const auto rep = static_cast<std::int32_t>(s.optional ? pq::Repetition::Optional
+                                                          : pq::Repetition::Required);
+    if (s.is_group) {
+        // A group (struct) has no physical type; it declares num_children.
+        w.field_i32(3, rep);
+        w.field_string(4, s.name);
+        w.field_i32(5, s.num_children);
+    } else {
+        w.field_i32(1, static_cast<std::int32_t>(s.type));
+        if (s.type == pq::Type::FixedLenByteArray) {
+            w.field_i32(2, s.type_length);
+        }
+        w.field_i32(3, rep);
+        w.field_string(4, s.name);
+        if (s.has_converted) {
+            w.field_i32(6, static_cast<std::int32_t>(s.converted));
+        }
     }
     w.end_struct();
 }
@@ -873,8 +950,10 @@ void serialize_column_chunk(CompactWriter& w, const ColumnChunkMeta& c, pq::Code
     for (auto e : c.encodings) {
         w.put_zigzag_i32(static_cast<std::int32_t>(e));
     }
-    w.field_list_header(3, CType::Binary, 1);
-    w.put_string(c.name);
+    w.field_list_header(3, CType::Binary, c.path.size());
+    for (const auto& p : c.path) {
+        w.put_string(p);
+    }
     w.field_i32(4, static_cast<std::int32_t>(codec));
     w.field_i64(5, c.num_values);
     w.field_i64(6, c.total_uncompressed);
@@ -892,15 +971,15 @@ std::vector<std::uint8_t> serialize_footer(const N2PWriter& w) {
     CompactWriter cw(buf);
     cw.begin_struct_element();  // FileMetaData
     cw.field_i32(1, 1);          // version
-    cw.field_list_header(2, CType::Struct, w.columns.size() + 1);
+    cw.field_list_header(2, CType::Struct, w.schema_nodes.size() + 1);
     {
         // root schema element: name + num_children only (no type/repetition).
         cw.begin_struct_element();
         cw.field_string(4, "schema");
-        cw.field_i32(5, static_cast<std::int32_t>(w.columns.size()));
+        cw.field_i32(5, w.top_children);
         cw.end_struct();
     }
-    for (const auto& s : w.columns) {
+    for (const auto& s : w.schema_nodes) {
         serialize_schema_element(cw, s);
     }
     cw.field_i64(3, w.total_rows);
@@ -929,43 +1008,65 @@ int write_one_batch(N2PWriter& w, const ArrowSchema* schema, const ArrowArray* b
         w.last_error = "top-level schema must be a struct (record batch)";
         return N2P_INVALID_ARGUMENT;
     }
-    const auto ncols = static_cast<std::size_t>(schema->n_children);
-    if (static_cast<std::size_t>(batch->n_children) != ncols) {
+    if (static_cast<int>(schema->n_children) == 0) {
+        w.last_error = "record batch has no columns";
+        return N2P_INVALID_ARGUMENT;
+    }
+    if (batch->n_children != schema->n_children) {
         w.last_error = "batch child count does not match schema";
         return N2P_INVALID_ARGUMENT;
     }
 
-    // Derive column specs from this schema.
-    std::vector<ColumnSpec> specs;
-    specs.reserve(ncols);
-    for (std::size_t i = 0; i < ncols; ++i) {
-        const ArrowSchema* child = schema->children[i];
-        std::string err;
-        const char* name = child->name ? child->name : "";
-        const bool nullable = (child->flags & ARROW_FLAG_NULLABLE) != 0;
-        auto spec = map_format(child->format, name, nullable, err);
-        if (!spec) {
-            w.last_error = err;
-            return N2P_UNSUPPORTED_TYPE;
-        }
-        specs.push_back(std::move(*spec));
-    }
-
+    // Flatten the (possibly nested) schema into leaf columns on the first batch.
     if (!w.schema_locked) {
-        w.columns = specs;
+        std::vector<SchemaNode> nodes;
+        std::vector<LeafSpec> leaves;
+        for (std::int64_t i = 0; i < schema->n_children; ++i) {
+            const ArrowSchema* child = schema->children[i];
+            const bool child_null = (child->flags & ARROW_FLAG_NULLABLE) != 0 ||
+                                    (child->format && std::strcmp(child->format, "n") == 0);
+            std::string err;
+            if (!flatten_schema(child, {static_cast<int>(i)},
+                                {child->name ? child->name : ""}, {child_null},
+                                nodes, leaves, err)) {
+                w.last_error = err;
+                return N2P_UNSUPPORTED_TYPE;
+            }
+        }
+        if (leaves.empty()) {
+            w.last_error = "record batch has no leaf columns";
+            return N2P_INVALID_ARGUMENT;
+        }
+        w.schema_nodes = std::move(nodes);
+        w.leaves = std::move(leaves);
+        w.top_children = static_cast<int>(schema->n_children);
         w.schema_locked = true;
-    } else if (specs.size() != w.columns.size()) {
+    } else if (static_cast<int>(schema->n_children) != w.top_children) {
         w.last_error = "batch schema is incompatible with the first batch";
         return N2P_INVALID_ARGUMENT;
     }
 
     RowGroupMeta rg;
     rg.num_rows = batch->length;
+    const auto n = static_cast<std::size_t>(batch->length);
 
     try {
-        for (std::size_t i = 0; i < ncols; ++i) {
-            const ColumnSpec& s = w.columns[i];
-            const ArrowArray* child = batch->children[i];
+        for (const LeafSpec& leaf : w.leaves) {
+            // Walk the array tree to the leaf, capturing each node's array (used
+            // for definition levels at every OPTIONAL node on the path).
+            std::vector<const ArrowArray*> nodes_arr;
+            nodes_arr.reserve(leaf.path_idx.size());
+            const ArrowArray* cur = batch;
+            for (const int ci : leaf.path_idx) {
+                if (cur->children == nullptr || ci >= cur->n_children) {
+                    w.last_error = "batch structure does not match the schema";
+                    return N2P_INVALID_ARGUMENT;
+                }
+                cur = cur->children[ci];
+                nodes_arr.push_back(cur);
+            }
+            const ColumnSpec& s = leaf.col;
+            const ArrowArray* child = nodes_arr.back();
             std::string err;
             if (!validate_child(*child, s, batch->length, err)) {
                 w.last_error = err;
@@ -974,25 +1075,44 @@ int write_one_batch(N2PWriter& w, const ArrowSchema* schema, const ArrowArray* b
 
             ColumnChunkMeta c;
             c.type = s.type;
-            c.name = s.name;
+            c.path = leaf.path_names;
             c.num_values = batch->length;
             c.file_offset = w.offset;
 
-            // OPTIONAL columns carry a definition-level prefix on every data page
-            // (1 = present, 0 = null); the value section then holds only present
-            // values. `validity` is nullptr when the chunk has no nulls, keeping
-            // the REQUIRED-equivalent fast path.
-            const auto* validity =
-                (s.nullable && s.extract != Extract::Null && child->n_buffers > 0)
-                    ? static_cast<const std::uint8_t*>(child->buffers[0])
-                    : nullptr;
-            const bool has_nulls = (child->null_count != 0) && validity != nullptr;
+            // Definition levels (max level = number of OPTIONAL nodes on the path).
+            // For each row, walk the path and count present OPTIONAL nodes until the
+            // first null; a value is stored only when all of them are present.
+            const int D = leaf.max_def_level;
             std::vector<std::uint8_t> def_prefix;
-            if (s.nullable) {
-                def_prefix = build_def_levels(validity, static_cast<std::size_t>(batch->length),
-                                              /*all_null=*/s.extract == Extract::Null);
+            std::vector<std::uint8_t> present_map;
+            const std::uint8_t* value_validity = nullptr;
+            if (D > 0) {
+                std::vector<std::uint32_t> def(n);
+                present_map.assign((n + 7) / 8, 0);
+                std::size_t present_count = 0;
+                const bool null_leaf = (s.extract == Extract::Null);
+                for (std::size_t i = 0; i < n; ++i) {
+                    int d = 0;
+                    bool present_all = true;
+                    for (std::size_t k = 0; k < nodes_arr.size(); ++k) {
+                        if (!leaf.path_optional[k]) continue;  // REQUIRED: always present
+                        const ArrowArray* a = nodes_arr[k];
+                        const bool is_leaf = (k + 1 == nodes_arr.size());
+                        const auto* val = (a->n_buffers > 0)
+                            ? static_cast<const std::uint8_t*>(a->buffers[0]) : nullptr;
+                        const bool present = (is_leaf && null_leaf) ? false : valid_bit(val, i);
+                        if (!present) { present_all = false; break; }
+                        ++d;
+                    }
+                    def[i] = static_cast<std::uint32_t>(d);
+                    if (present_all && d == D) {
+                        present_map[i >> 3] |= static_cast<std::uint8_t>(1u << (i & 7));
+                        ++present_count;
+                    }
+                }
+                def_prefix = encode_definition_levels(def, leaf.def_bit_width);
+                if (present_count < n) value_validity = present_map.data();
             }
-            const std::uint8_t* value_validity = has_nulls ? validity : nullptr;
 
             if (s.extract == Extract::ByteArray) {
                 DictPages pages = build_dictionary_pages(*child, s, value_validity);
