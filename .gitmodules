@@ -1,0 +1,3 @@
+[submodule "examples/pcapng2parquet/extern/nanotins"]
+	path = examples/pcapng2parquet/extern/nanotins
+	url = https://github.com/yoavbendor/nanotins.git
