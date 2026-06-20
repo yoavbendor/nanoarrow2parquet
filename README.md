@@ -141,14 +141,27 @@ w.write_chunk(more_ids, present(more_xs, more_mask), more_names);
 w.close();
 ```
 
+Nested structs are described with `Struct<>` / `NullableStruct<>` and assembled
+from their children's columns with `group(...)` (or `group_present(mask, ...)` /
+`group_valid(bitmap, nulls, ...)` for an OPTIONAL struct), to any depth:
+
+```cpp
+Writer<Field<"id", std::int32_t>,
+       Struct<"addr", Field<"city", utf8>, Field<"zip", std::int32_t>>,
+       NullableStruct<"meta", Field<"score", double>>> w("out.parquet");
+
+w.write_chunk(ids, group(cities, zips), group_present(meta_mask, scores));
+```
+
 Each `write_chunk` is exactly one row group, so the producer keeps batching policy
 and the writer never buffers the whole dataset. Supported: REQUIRED/OPTIONAL
 fixed-width numeric columns (zero-copy aliases of your storage), `bool` (packed to
-1 bit per value per chunk), and `utf8`/`binary`/`large_utf8`/`large_binary` columns
-(offsets + data materialized per chunk). Nullable columns take
-`present(values, mask)` or `valid_bits(values, bitmap, null_count)` (the latter
-aliases a pre-packed bitmap). Nested structs still go through the `ArrowArray` API
-above. Unsupported types, duplicate names, and type mismatches are `static_assert`s.
+1 bit per value per chunk), `utf8`/`binary`/`large_utf8`/`large_binary` columns
+(offsets + data materialized per chunk), and nested `Struct`/`NullableStruct`
+groups (multi-level definition levels — a null can come from a leaf or any
+ancestor struct). Nullable columns take `present(values, mask)` or
+`valid_bits(values, bitmap, null_count)` (the latter aliases a pre-packed bitmap).
+Unsupported types, duplicate names, and type mismatches are `static_assert`s.
 
 ## Single-header build
 
