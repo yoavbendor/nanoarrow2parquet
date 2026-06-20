@@ -168,6 +168,25 @@ is pinned to the same commit nanolance uses. Embedding parents that already prov
   reads them back with pyarrow (and pandas/polars if installed) and asserts the
   values, dtypes, ZSTD codec, dictionary encoding, and row-group count.
 
+## Benchmarks
+
+[`bench/`](bench/) compares write throughput and output size against the Apache
+Parquet C++ writer, streaming datasets in chunks (row groups) so the total exceeds
+peak memory. Data generation is timed separately from writing, and the Apache
+baseline is configured to match n2p's choices (PLAIN, ZSTD level 3, one row group
+per chunk). The Arrow side links the `libparquet` bundled in pyarrow, so no Arrow
+source build is needed. See [`bench/README.md`](bench/README.md).
+
+```sh
+cmake -S . -B build -DN2P_BUILD_BENCHMARKS=ON
+cmake --build build --target bench_n2p bench_arrow
+python3 bench/run_bench.py --totals 1024,4096,8192 --chunks 200,500
+```
+
+At parity settings, ZSTD speed/size land within ~1% of Arrow (both bottleneck on
+zstd), while n2p's near-`memcpy` uncompressed path writes faster with near-zero
+size overhead and lower peak RSS.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE), [NOTICE](NOTICE), and

@@ -117,6 +117,61 @@ if(N2P_BUILD_EXAMPLES)
     target_link_libraries(pcapng2parquet PRIVATE nanoarrow2parquet nanoarrow_static)
 endif()
 
+# --- benchmarks (vs Apache Parquet C++) ---
+option(N2P_BUILD_BENCHMARKS "Build write benchmarks vs Apache Parquet C++" OFF)
+if(N2P_BUILD_BENCHMARKS)
+    add_executable(bench_n2p bench/bench_n2p.cpp)
+    target_include_directories(bench_n2p PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/bench)
+    target_link_libraries(bench_n2p PRIVATE nanoarrow2parquet nanoarrow_static)
+
+    # The Apache baseline links the Parquet C++ libraries. By default we discover
+    # the ones bundled in an installed pyarrow wheel (headers + libarrow/libparquet
+    # shared objects), which avoids building Arrow from source. Override with
+    # -DARROW_INCLUDE_DIR=... -DARROW_LIB_DIR=... to use a system/conda Arrow.
+    if(NOT DEFINED ARROW_INCLUDE_DIR OR NOT DEFINED ARROW_LIB_DIR)
+        find_package(Python3 COMPONENTS Interpreter QUIET)
+        if(Python3_Interpreter_FOUND)
+            execute_process(
+                COMMAND ${Python3_EXECUTABLE} -c
+                    "import pyarrow,os;print(pyarrow.get_include());print(os.path.dirname(pyarrow.__file__))"
+                OUTPUT_VARIABLE _pa_out OUTPUT_STRIP_TRAILING_WHITESPACE
+                RESULT_VARIABLE _pa_rc ERROR_QUIET)
+            if(_pa_rc EQUAL 0)
+                string(REGEX MATCHALL "[^\n]+" _pa_lines "${_pa_out}")
+                list(GET _pa_lines 0 _pa_inc)
+                list(GET _pa_lines 1 _pa_lib)
+                if(NOT DEFINED ARROW_INCLUDE_DIR)
+                    set(ARROW_INCLUDE_DIR "${_pa_inc}")
+                endif()
+                if(NOT DEFINED ARROW_LIB_DIR)
+                    set(ARROW_LIB_DIR "${_pa_lib}")
+                endif()
+            endif()
+        endif()
+    endif()
+
+    if(DEFINED ARROW_INCLUDE_DIR AND DEFINED ARROW_LIB_DIR)
+        file(GLOB _arrow_so "${ARROW_LIB_DIR}/libarrow.so*")
+        file(GLOB _parquet_so "${ARROW_LIB_DIR}/libparquet.so*")
+        if(_arrow_so AND _parquet_so)
+            list(GET _arrow_so 0 ARROW_SO)
+            list(GET _parquet_so 0 PARQUET_SO)
+            add_executable(bench_arrow bench/bench_arrow.cpp)
+            target_include_directories(bench_arrow PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/bench ${ARROW_INCLUDE_DIR})
+            target_link_libraries(bench_arrow PRIVATE ${PARQUET_SO} ${ARROW_SO})
+            set_target_properties(bench_arrow PROPERTIES
+                BUILD_RPATH "${ARROW_LIB_DIR}" INSTALL_RPATH "${ARROW_LIB_DIR}")
+            message(STATUS "bench_arrow: using Arrow at ${ARROW_LIB_DIR}")
+        else()
+            message(WARNING "bench_arrow skipped: no libarrow/libparquet in ${ARROW_LIB_DIR}")
+        endif()
+    else()
+        message(WARNING "bench_arrow skipped: Arrow C++ not found (install pyarrow "
+                        "or set -DARROW_INCLUDE_DIR / -DARROW_LIB_DIR). bench_n2p still builds.")
+    endif()
+endif()
+
 if(N2P_BUILD_TESTS)
     enable_testing()
     add_executable(test_roundtrip tests/test_roundtrip.cpp)
