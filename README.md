@@ -143,8 +143,9 @@ w.close();
 
 Each `write_chunk` is exactly one row group, so the producer keeps batching policy
 and the writer never buffers the whole dataset. Supported: REQUIRED/OPTIONAL
-fixed-width numeric columns (zero-copy aliases of your storage) and `utf8`/`binary`
-columns (offsets + data materialized per chunk). Nullable columns take
+fixed-width numeric columns (zero-copy aliases of your storage), `bool` (packed to
+1 bit per value per chunk), and `utf8`/`binary` columns (offsets + data
+materialized per chunk). Nullable columns take
 `present(values, mask)` or `valid_bits(values, bitmap, null_count)` (the latter
 aliases a pre-packed bitmap). Nested structs still go through the `ArrowArray` API
 above. Unsupported types, duplicate names, and type mismatches are `static_assert`s.

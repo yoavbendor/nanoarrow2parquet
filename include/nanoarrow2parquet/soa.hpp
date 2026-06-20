@@ -28,9 +28,12 @@
 // of string-like values. These are not zero-copy -- the offsets and data buffers
 // are materialized per chunk -- but they need no Arrow structs from nanoarrow.
 //
+// Bool: declare the field bool and pass a range of bool. Also not zero-copy --
+// byte-per-bool storage is packed into Arrow's 1-bit-per-value bitmap per chunk.
+//
 // Scope: REQUIRED or OPTIONAL fixed-width numeric columns (int8/16/32/64,
-// uint8/16/32/64, float, double) and utf8/binary columns. Nested structs are not
-// yet reachable from this path -- use the ArrowArray C API for those.
+// uint8/16/32/64, float, double), bool, and utf8/binary columns. Nested structs
+// are not yet reachable from this path -- use the ArrowArray C API for those.
 
 #include "nanoarrow2parquet/nanoarrow2parquet.h"
 
@@ -123,7 +126,8 @@ consteval const char* string_format() {
 }
 
 template <class T>
-concept SupportedField = (requires { arrow_traits<T>::format; }) || is_string_field_v<T>;
+concept SupportedField = (requires { arrow_traits<T>::format; })
+                      || is_string_field_v<T> || std::is_same_v<T, bool>;
 
 // ---- field / schema description ------------------------------------------
 
@@ -210,7 +214,7 @@ template <class... Fields>
 class Writer {
     static_assert(sizeof...(Fields) > 0, "schema must have at least one field");
     static_assert((SupportedField<typename Fields::type> && ...),
-                  "every field type must be a supported numeric type, utf8, or binary");
+                  "every field type must be a supported numeric type, bool, utf8, or binary");
 
     static constexpr std::size_t K = sizeof...(Fields);
     template <std::size_t I>
@@ -344,6 +348,20 @@ private:
                 cb[J][1] = off.data();                                    // offsets
                 cb[J][2] = dat.data();                                    // data
                 ca[J].n_buffers = 3;
+            } else if constexpr (std::is_same_v<FT, bool>) {
+                static_assert(std::same_as<column_value_t<decltype(values)>, bool>,
+                              "bool column must be a range of bool");
+                // Pack byte-per-bool into Arrow's LSB-first 1-bit-per-value layout.
+                auto& packed = data_store[J];
+                packed.assign((static_cast<std::size_t>(n) + 7) / 8, 0);
+                std::size_t i = 0;
+                for (auto&& v : values) {
+                    if (static_cast<bool>(v)) packed[i >> 3] |= static_cast<std::uint8_t>(1u << (i & 7));
+                    ++i;
+                }
+                cs[J].format = "b";
+                cb[J][1] = packed.data();                                 // bit-packed values
+                ca[J].n_buffers = 2;
             } else {
                 static_assert(std::same_as<column_value_t<decltype(values)>, FT>,
                               "SoA column element type does not match its field type");

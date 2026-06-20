@@ -34,7 +34,7 @@ static_assert(std::string_view(arrow_traits<std::uint64_t>::format) == "L");
 static_assert(std::string_view(arrow_traits<float>::format)         == "f");
 static_assert(std::string_view(arrow_traits<double>::format)        == "g");
 static_assert(SupportedField<std::int32_t> && SupportedField<double>);
-static_assert(!SupportedField<bool> && !SupportedField<long double>);
+static_assert(SupportedField<bool> && !SupportedField<long double>);
 
 int main(int argc, char** argv) {
     const char* path = (argc > 1) ? argv[1] : "n2p_soa.parquet";
