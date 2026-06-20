@@ -30,7 +30,7 @@ import subprocess
 import sys
 
 
-def run_one(binary, total_mb, chunk_mb, codec, strings, null_pct, out_path, repeat):
+def run_one(binary, total_mb, chunk_mb, codec, strings, null_pct, out_path, repeat, wide=False):
     """Run a benchmark binary `repeat` times; return the result with the median
     write_s (data generation is excluded from the write timing by the binary)."""
     results = []
@@ -38,6 +38,7 @@ def run_one(binary, total_mb, chunk_mb, codec, strings, null_pct, out_path, repe
         proc = subprocess.run(
             [binary, "--total-mb", str(total_mb), "--chunk-mb", str(chunk_mb),
              "--codec", codec, "--strings" if strings else "--no-strings",
+             "--wide" if wide else "--no-wide",
              "--null-pct", str(null_pct), "--out", out_path],
             capture_output=True, text=True)
         if proc.returncode != 0:
@@ -72,6 +73,10 @@ def main():
     ap.add_argument("--null-pct", type=int, default=0, help="percent nulls (>0 makes columns OPTIONAL)")
     ap.add_argument("--no-strings", dest="strings", action="store_false",
                     help="numeric-only columns (no dictionary-encoded strings)")
+    ap.add_argument("--wide", action="store_true",
+                    help="add the extra-type columns (int8/16, uint32/64, float, bool)")
+    ap.add_argument("--no-soa", dest="soa", action="store_false",
+                    help="skip the compile-time SoA path (bench_n2p_soa)")
     ap.add_argument("--quick", action="store_true", help="tiny smoke matrix (200MB totals)")
     ap.add_argument("--check", action="store_true",
                     help="regression gate: assert n2p stays competitive with Arrow on the "
@@ -93,9 +98,11 @@ def main():
 
     bn = os.path.join(args.bin_dir, "bench_n2p")
     ba = os.path.join(args.bin_dir, "bench_arrow")
+    bs = os.path.join(args.bin_dir, "bench_n2p_soa")
     if not os.path.exists(bn):
         raise SystemExit(f"missing {bn}; build with -DN2P_BUILD_BENCHMARKS=ON")
     have_arrow = os.path.exists(ba)
+    have_soa = args.soa and os.path.exists(bs)
     if not have_arrow:
         if args.check:
             raise SystemExit(f"--check needs the Apache baseline ({ba}); build it with "
@@ -103,9 +110,11 @@ def main():
         sys.stderr.write(f"note: {ba} not found -- running n2p only (no Apache baseline)\n")
 
     free_gb = shutil.disk_usage(args.out_dir).free / 2**30
-    cols = "id,value,category,level,path" if args.strings else "id,value,category"
+    cols = "id,value,category" + (",level,path" if args.strings else "")
+    if args.wide:
+        cols += ",small,small16,ucount,subtotal,ratio,flag"
     sys.stderr.write(f"scratch={args.out_dir} free={free_gb:.1f}GB repeat={args.repeat} "
-                     f"columns=[{cols}]\n")
+                     f"soa={'on' if have_soa else 'off'} columns=[{cols}]\n")
 
     hdr = (f"{'total':>7} {'chunk':>6} {'codec':>12} {'lib':>6} "
            f"{'write_s':>9} {'write_GB/s':>11} {'Mrows/s':>9} {'file':>10} "
@@ -121,12 +130,21 @@ def main():
                 continue
             for codec in codecs:
                 row_n = run_one(bn, total, chunk, codec, args.strings, args.null_pct,
-                                os.path.join(args.out_dir, "n2p_bench.parquet"), args.repeat)
+                                os.path.join(args.out_dir, "n2p_bench.parquet"), args.repeat,
+                                wide=args.wide)
                 raw.append(row_n)
                 rows = [("n2p", row_n)]
+                row_s = None
+                if have_soa:
+                    row_s = run_one(bs, total, chunk, codec, args.strings, args.null_pct,
+                                    os.path.join(args.out_dir, "n2p_soa_bench.parquet"), args.repeat,
+                                    wide=args.wide)
+                    raw.append(row_s)
+                    rows.append(("n2p_soa", row_s))
                 if have_arrow:
                     row_a = run_one(ba, total, chunk, codec, args.strings, args.null_pct,
-                                    os.path.join(args.out_dir, "arrow_bench.parquet"), args.repeat)
+                                    os.path.join(args.out_dir, "arrow_bench.parquet"), args.repeat,
+                                    wide=args.wide)
                     raw.append(row_a)
                     rows.append(("arrow", row_a))
                 for lib, r in rows:
@@ -135,6 +153,15 @@ def main():
                           f"{r['mrows_per_s']:>9.2f} {fmt_bytes(r['file_bytes']):>10} "
                           f"{r['bytes_per_row']:>7.2f} {r['gen_s']:>8.3f} "
                           f"{r['peak_rss_mb']:>8.0f}M")
+                if row_s is not None:
+                    # SoA (compile-time) write time relative to the runtime path; >1
+                    # means SoA is faster. Same encoding, so file sizes should match.
+                    swr = row_n["write_s"] / row_s["write_s"] if row_s["write_s"] else 0
+                    sfaster = "faster" if swr >= 1 else "slower"
+                    ssize = row_s["file_bytes"] / row_n["file_bytes"] if row_n["file_bytes"] else 0
+                    print(f"{'':>7} {'':>6} {codec:>12} {'ratio':>6} "
+                          f"  n2p_soa write {swr:.2f}x n2p ({sfaster}),  "
+                          f"soa file {ssize:.3f}x n2p")
                 if have_arrow:
                     spd = row_a["write_s"] / row_n["write_s"] if row_n["write_s"] else 0
                     size = row_n["file_bytes"] / row_a["file_bytes"] if row_a["file_bytes"] else 0
@@ -155,6 +182,18 @@ def main():
                             failures.append(f"ROWS   {cfg}: n2p {row_n['rows']} != arrow {row_a['rows']}")
                         if row_n["file_bytes"] == 0:
                             failures.append(f"EMPTY  {cfg}: n2p produced an empty file")
+                if args.check and row_s is not None:
+                    cfg = f"total={total}M chunk={chunk}M {codec} strings={args.strings} wide={args.wide}"
+                    # SoA writes the same encoding as the runtime path, so the file
+                    # should be within a few percent; rows must match exactly.
+                    if row_s["rows"] != row_n["rows"]:
+                        failures.append(f"SOAROW {cfg}: soa {row_s['rows']} != n2p {row_n['rows']}")
+                    if row_s["file_bytes"] == 0:
+                        failures.append(f"SOAEMP {cfg}: soa produced an empty file")
+                    elif row_n["file_bytes"]:
+                        sr = row_s["file_bytes"] / row_n["file_bytes"]
+                        if sr > 1.05 or sr < 0.95:
+                            failures.append(f"SOASZ  {cfg}: soa file {sr:.3f}x n2p (expected ~1.0)")
                 print()
 
     if args.json:

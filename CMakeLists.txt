@@ -124,6 +124,12 @@ if(N2P_BUILD_BENCHMARKS)
     target_include_directories(bench_n2p PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/bench)
     target_link_libraries(bench_n2p PRIVATE nanoarrow2parquet nanoarrow_static)
 
+    # Compile-time SoA path benchmark. Links only nanoarrow2parquet (no nanoarrow),
+    # matching how the SoA front-end is meant to be consumed.
+    add_executable(bench_n2p_soa bench/bench_n2p_soa.cpp)
+    target_include_directories(bench_n2p_soa PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/bench)
+    target_link_libraries(bench_n2p_soa PRIVATE nanoarrow2parquet)
+
     # The Apache baseline links the Parquet C++ libraries. By default we discover
     # the ones bundled in an installed pyarrow wheel (headers + libarrow/libparquet
     # shared objects), which avoids building Arrow from source. Override with

@@ -2,7 +2,10 @@
 
 Measures **write throughput** and **output size** of nanoarrow2parquet against the
 Apache Parquet C++ writer (`parquet::arrow::FileWriter`), on datasets streamed in
-chunks so the total exceeds peak resident memory.
+chunks so the total exceeds peak resident memory. A third library, **`n2p_soa`**,
+benchmarks the compile-time struct-of-arrays front-end ([`soa.hpp`](../include/nanoarrow2parquet/soa.hpp))
+against the runtime `ArrowArray` path on identical data — see
+[Compile-time SoA path](#compile-time-soa-path).
 
 Methodology follows [carquet's benchmark suite](https://github.com/Vitruves/carquet/tree/master/benchmark):
 deterministic LCG-generated data, **write timed separately from data generation**,
@@ -69,6 +72,40 @@ Because each chunk is freed before the next, **peak RSS ≈ one chunk** while th
 dataset total (1/4/8 GB) is far larger — the larger-than-RAM requirement. Both
 binaries print a JSON result line; `run_bench.py` aggregates and ratios them.
 
+## Compile-time SoA path
+
+`bench_n2p_soa` drives the native struct-of-arrays writer (`n2p::soa::Writer`,
+compile-time schema, no nanoarrow) so the **compile-time path is benchmarked head
+to head with the pure runtime path** on the same data and chunking. It emits the
+same JSON line with `"lib":"n2p_soa"`, and `run_bench.py` prints a
+`n2p_soa write Nx n2p` ratio plus a `soa file Nx n2p` size ratio (which should be
+`1.000×` — both write identical Parquet encodings).
+
+The split between **gen** and **write** is the interesting contrast:
+
+- The runtime path produces data already in Arrow layout, so its `gen` builds
+  offsets/validity/packed-bool buffers and its `write` is pure serialization.
+- The SoA path produces natural SoA columns (one `std::vector` per column;
+  strings as `std::string_view` into the pools), so its `gen` is cheaper and its
+  `write` does the materialization fixed-width columns are aliased with no copy;
+  strings (offsets+data) and bool (bit-pack) are built during `write`.
+
+So for fixed-width-heavy schemas the SoA path tends to match or beat the runtime
+path end to end, while for string-heavy schemas the work simply moves from `gen`
+into `write`. File sizes are identical either way.
+
+`--wide` adds a column set that exercises the broader type support of both paths
+(also accepted by the runtime/Arrow binaries):
+
+| column | type | notes |
+|---|---|---|
+| `small` | int8 | widened to INT32 + `INT_8` |
+| `small16` | int16 | widened to INT32 + `INT_16` |
+| `ucount` | uint32 | INT32 + `UINT_32` |
+| `subtotal` | uint64 | INT64 + `UINT_64` |
+| `ratio` | float | PLAIN float |
+| `flag` | bool | bit-packed (SoA packs byte-per-bool during write) |
+
 ## Fairness
 
 Both writers consume the *same* generated C Data Interface arrays. The Apache
@@ -91,7 +128,7 @@ size or speed.
 
 ```sh
 cmake -S . -B build -DN2P_BUILD_BENCHMARKS=ON
-cmake --build build --target bench_n2p bench_arrow
+cmake --build build --target bench_n2p bench_n2p_soa bench_arrow
 ```
 
 `bench_arrow` links the Apache Parquet C++ libraries. By default CMake discovers
@@ -120,7 +157,12 @@ python3 bench/run_bench.py --quick                 # 200MB smoke run
 python3 bench/run_bench.py --repeat 5 --json out.json   # median of 5, dump raw
 python3 bench/run_bench.py --null-pct 30            # OPTIONAL columns, ~30% nulls
 python3 bench/run_bench.py --no-strings             # numeric-only (no dictionary)
+python3 bench/run_bench.py --no-strings --wide      # add int8/16, uint32/64, float, bool
+python3 bench/run_bench.py --no-soa                 # skip the compile-time SoA path
 ```
+
+`bench_n2p_soa` is run automatically when present (built by the command above);
+pass `--no-soa` to compare only the runtime path against Arrow.
 
 `--null-pct N` makes every column nullable (OPTIONAL) with ~N% randomly-placed
 nulls, exercising the definition-level path on both writers.
@@ -146,7 +188,10 @@ shared CI runners. It fails (exit 1) if, for any config:
 - `n2p write_s > arrow write_s * --max-write-ratio` (default 2.5 — generous; n2p
   is normally faster or on par), or
 - `n2p file_bytes > arrow file_bytes * --max-size-ratio` (default 1.10), or
-- row counts disagree / n2p emits an empty file.
+- row counts disagree / n2p emits an empty file, or
+- (when `bench_n2p_soa` is present) the SoA path's row count differs from the
+  runtime path, it emits an empty file, or its file size drifts more than ±5% from
+  the runtime path's (same encoding ⇒ should be ~1.0×).
 
 This runs two ways:
 
@@ -178,8 +223,9 @@ published table is always attributable to a specific build and machine.
 ## Direct binary use
 
 ```sh
-./build/bench_n2p   --total-mb 4096 --chunk-mb 500 --codec zstd --out /tmp/n.parquet
-./build/bench_arrow --total-mb 4096 --chunk-mb 500 --codec zstd --out /tmp/a.parquet
+./build/bench_n2p     --total-mb 4096 --chunk-mb 500 --codec zstd --out /tmp/n.parquet
+./build/bench_n2p_soa --total-mb 4096 --chunk-mb 500 --codec zstd --wide --out /tmp/s.parquet
+./build/bench_arrow   --total-mb 4096 --chunk-mb 500 --codec zstd --out /tmp/a.parquet
 ```
 
 Each prints one JSON line: `gen_s`, `write_s`, `write_gbps`, `mrows_per_s`,
