@@ -112,17 +112,26 @@ N2P_SOA_TRAIT(double,        "g");
 
 // Variable-length field tags. Unlike the numeric types these are not zero-copy:
 // a SoA string column (range of string-like values) is materialized into Arrow
-// offsets + data buffers per chunk.
-struct utf8 {};    // -> BYTE_ARRAY annotated UTF8
-struct binary {};  // -> BYTE_ARRAY, no annotation
+// offsets + data buffers per chunk. The large_* variants use 64-bit offsets.
+struct utf8 {};          // -> BYTE_ARRAY annotated UTF8, 32-bit offsets
+struct binary {};        // -> BYTE_ARRAY, 32-bit offsets
+struct large_utf8 {};    // -> BYTE_ARRAY annotated UTF8, 64-bit offsets
+struct large_binary {};  // -> BYTE_ARRAY, 64-bit offsets
 
 template <class T>
-inline constexpr bool is_string_field_v = std::is_same_v<T, utf8> || std::is_same_v<T, binary>;
+inline constexpr bool is_large_string_v =
+    std::is_same_v<T, large_utf8> || std::is_same_v<T, large_binary>;
+
+template <class T>
+inline constexpr bool is_string_field_v =
+    std::is_same_v<T, utf8> || std::is_same_v<T, binary> || is_large_string_v<T>;
 
 template <class T>
 consteval const char* string_format() {
     if constexpr (std::is_same_v<T, utf8>) return "u";
-    else return "z";
+    else if constexpr (std::is_same_v<T, binary>) return "z";
+    else if constexpr (std::is_same_v<T, large_utf8>) return "U";
+    else return "Z";
 }
 
 template <class T>
@@ -329,18 +338,19 @@ private:
             if constexpr (is_string_field_v<FT>) {
                 static_assert(std::convertible_to<column_value_t<decltype(values)>, std::string_view>,
                               "string/binary column must be a range of string-like values");
+                using off_t = std::conditional_t<is_large_string_v<FT>, std::int64_t, std::int32_t>;
                 auto& off = off_store[J];
                 auto& dat = data_store[J];
-                off.resize(sizeof(std::int32_t) * (static_cast<std::size_t>(n) + 1));
-                auto* o = reinterpret_cast<std::int32_t*>(off.data());
-                std::int32_t cur = 0;
+                off.resize(sizeof(off_t) * (static_cast<std::size_t>(n) + 1));
+                auto* o = reinterpret_cast<off_t*>(off.data());
+                off_t cur = 0;
                 o[0] = 0;
                 std::size_t i = 0;
                 for (auto&& e : values) {
                     if (present_at(i)) {
                         std::string_view sv(e);
                         dat.insert(dat.end(), sv.begin(), sv.end());
-                        cur += static_cast<std::int32_t>(sv.size());
+                        cur += static_cast<off_t>(sv.size());
                     }
                     o[++i] = cur;
                 }
