@@ -113,8 +113,27 @@ if(N2P_BUILD_EXAMPLES)
     add_executable(arrow2parquet_demo examples/arrow2parquet_demo.cpp)
     target_link_libraries(arrow2parquet_demo PRIVATE nanoarrow2parquet nanoarrow_static)
 
-    add_executable(pcapng2parquet examples/pcapng2parquet.cpp)
-    target_link_libraries(pcapng2parquet PRIVATE nanoarrow2parquet nanoarrow_static)
+    # pcapng2parquet: full pcap/pcapng parsing (L1 + L2/L3/L4 + PTP) -> per-PDU Parquet tables, the
+    # Parquet-output twin of nanolance's pcapng2lance. It vendors the SAME nanotins parsing stack (as a
+    # git submodule) and reuses its soatins -> Arrow reflection; only the output endpoint is
+    # nanoarrow2parquet instead of nanolance. We pull in JUST soatins (the reflection nucleus: boost +
+    # nanoarrow, reusing OUR nanoarrow_static target) and add nanotins's header-only include dir directly
+    # -- deliberately NOT add_subdirectory(extern/nanotins), so nanotins's stdexec FetchContent (only
+    # needed for its bulk path, which this example does not use -- decode runs serially) never runs.
+    set(N2P_NANOTINS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/examples/pcapng2parquet/extern/nanotins)
+    if(NOT EXISTS "${N2P_NANOTINS_DIR}/CMakeLists.txt")
+        message(FATAL_ERROR
+            "examples/pcapng2parquet/extern/nanotins is empty -- run: "
+            "git submodule update --init --recursive")
+    endif()
+    add_subdirectory(${N2P_NANOTINS_DIR}/soatins ${CMAKE_CURRENT_BINARY_DIR}/soatins)
+
+    add_executable(pcapng2parquet examples/pcapng2parquet/src/pcapng2parquet_main.cpp)
+    target_include_directories(pcapng2parquet PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/examples/pcapng2parquet/include
+        ${N2P_NANOTINS_DIR}/nanotins/include
+        ${N2P_NANOTINS_DIR}/examples/lldp)  # the user-written LLDP DPAR palette (lldp.hpp)
+    target_link_libraries(pcapng2parquet PRIVATE nanoarrow2parquet nanoarrow_static soatins_core)
 endif()
 
 # --- benchmarks (vs Apache Parquet C++) ---
@@ -238,6 +257,17 @@ if(N2P_BUILD_TESTS)
 
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
+        # End-to-end: pcapng2parquet decodes a synthesized capture (Ethernet/IPv4/UDP + LLDP) and the
+        # per-layer Parquet tables read back correctly via pyarrow. Skips (77) when pyarrow is absent or
+        # the example was not built (needs the nanotins submodule).
+        if(TARGET pcapng2parquet)
+            add_test(NAME pcapng2parquet_check
+                     COMMAND ${Python3_EXECUTABLE}
+                             ${CMAKE_CURRENT_SOURCE_DIR}/examples/pcapng2parquet/tests/check_pcapng2parquet.py
+                             $<TARGET_FILE:pcapng2parquet>)
+            set_tests_properties(pcapng2parquet_check PROPERTIES SKIP_RETURN_CODE 77)
+        endif()
+
         add_test(NAME smoke_pyarrow
                  COMMAND ${CMAKE_COMMAND} -E env
                          N2P_DEMO=$<TARGET_FILE:arrow2parquet_demo>
