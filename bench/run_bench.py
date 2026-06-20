@@ -30,7 +30,7 @@ import subprocess
 import sys
 
 
-def run_one(binary, total_mb, chunk_mb, codec, strings, out_path, repeat):
+def run_one(binary, total_mb, chunk_mb, codec, strings, null_pct, out_path, repeat):
     """Run a benchmark binary `repeat` times; return the result with the median
     write_s (data generation is excluded from the write timing by the binary)."""
     results = []
@@ -38,7 +38,7 @@ def run_one(binary, total_mb, chunk_mb, codec, strings, out_path, repeat):
         proc = subprocess.run(
             [binary, "--total-mb", str(total_mb), "--chunk-mb", str(chunk_mb),
              "--codec", codec, "--strings" if strings else "--no-strings",
-             "--out", out_path],
+             "--null-pct", str(null_pct), "--out", out_path],
             capture_output=True, text=True)
         if proc.returncode != 0:
             sys.stderr.write(proc.stdout + proc.stderr)
@@ -69,6 +69,7 @@ def main():
     ap.add_argument("--codecs", default="zstd,uncompressed", help="codecs (comma list)")
     ap.add_argument("--repeat", type=int, default=1, help="iterations per config (median write taken)")
     ap.add_argument("--out-dir", default="/tmp", help="scratch dir for output parquet files")
+    ap.add_argument("--null-pct", type=int, default=0, help="percent nulls (>0 makes columns OPTIONAL)")
     ap.add_argument("--no-strings", dest="strings", action="store_false",
                     help="numeric-only columns (no dictionary-encoded strings)")
     ap.add_argument("--quick", action="store_true", help="tiny smoke matrix (200MB totals)")
@@ -119,12 +120,12 @@ def main():
             if chunk > total:
                 continue
             for codec in codecs:
-                row_n = run_one(bn, total, chunk, codec, args.strings,
+                row_n = run_one(bn, total, chunk, codec, args.strings, args.null_pct,
                                 os.path.join(args.out_dir, "n2p_bench.parquet"), args.repeat)
                 raw.append(row_n)
                 rows = [("n2p", row_n)]
                 if have_arrow:
-                    row_a = run_one(ba, total, chunk, codec, args.strings,
+                    row_a = run_one(ba, total, chunk, codec, args.strings, args.null_pct,
                                     os.path.join(args.out_dir, "arrow_bench.parquet"), args.repeat)
                     raw.append(row_a)
                     rows.append(("arrow", row_a))

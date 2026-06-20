@@ -15,19 +15,23 @@ after changes (see [Publishing](#publishing-results)).
 
 <!-- BENCH_RESULTS_START -->
 
-_nanoarrow2parquet **v0.1.0** @ `9fdd585` (dirty) · 2026-06-20_
+_nanoarrow2parquet **v0.1.0** @ `e158a43` (dirty) · 2026-06-20_
 
 - **Host:** Intel(R) Xeon(R) Processor @ 2.80GHz · 4 cores · Linux 6.18.5
 - **Baseline:** Apache Parquet C++ via pyarrow 24.0.0 (`parquet::arrow::FileWriter`), same settings
 - **Columns:** id(i64), value(f64), category(i32), level(utf8 dict), path(utf8 dict)
 - **Phases:** write only (data generation excluded); ZSTD level 3; one row group per chunk; streamed so peak RSS ≈ one chunk.
 
-| total | chunk | codec | n2p GB/s | arrow GB/s | n2p write | n2p file | arrow file | n2p/arrow size | peak RSS (n2p/arrow) |
-|---:|---:|:--|---:|---:|:--:|---:|---:|:--:|:--:|
-| 1024 MB | 200 MB | uncompressed | 0.836 | 0.746 | **1.12×** | 275.6 MB | 275.8 MB | 0.999× | 256/340 MB |
-| 1024 MB | 200 MB | zstd | 0.456 | 0.417 | **1.09×** | 189.2 MB | 189.3 MB | 0.999× | 256/304 MB |
-| 1024 MB | 500 MB | uncompressed | 0.844 | 0.474 | **1.78×** | 275.6 MB | 275.8 MB | 0.999× | 634/724 MB |
-| 1024 MB | 500 MB | zstd | 0.439 | 0.409 | **1.07×** | 189.2 MB | 189.3 MB | 0.999× | 635/670 MB |
+| total | chunk | codec | nulls | n2p GB/s | arrow GB/s | n2p write | n2p file | arrow file | n2p/arrow size | peak RSS (n2p/arrow) |
+|---:|---:|:--|---:|---:|---:|:--:|---:|---:|:--:|:--:|
+| 1024 MB | 200 MB | uncompressed | 0% | 0.498 | 0.434 | **1.15×** | 275.6 MB | 275.8 MB | 0.999× | 266/340 MB |
+| 1024 MB | 200 MB | uncompressed | 30% | 0.448 | 0.360 | **1.24×** | 201.1 MB | 202.1 MB | 0.995× | 256/329 MB |
+| 1024 MB | 200 MB | zstd | 0% | 0.265 | 0.269 | **0.98×** | 189.2 MB | 189.3 MB | 0.999× | 277/304 MB |
+| 1024 MB | 200 MB | zstd | 30% | 0.293 | 0.262 | **1.12×** | 139.8 MB | 142.3 MB | 0.983× | 257/302 MB |
+| 1024 MB | 500 MB | uncompressed | 0% | 0.334 | 0.480 | **0.70×** | 275.6 MB | 275.8 MB | 0.999× | 634/724 MB |
+| 1024 MB | 500 MB | uncompressed | 30% | 0.425 | 0.300 | **1.42×** | 201.0 MB | 202.1 MB | 0.995× | 615/715 MB |
+| 1024 MB | 500 MB | zstd | 0% | 0.269 | 0.314 | **0.86×** | 189.2 MB | 189.3 MB | 0.999× | 635/670 MB |
+| 1024 MB | 500 MB | zstd | 30% | 0.303 | 0.251 | **1.21×** | 139.7 MB | 142.2 MB | 0.982× | 615/685 MB |
 
 _`n2p write` is the speedup vs Arrow (>1 = n2p faster). Numbers are the median of the run's repeats on a shared cloud VM — treat small (<1.1×) differences as noise; regenerate with `bench/render_results.py`._
 
@@ -114,7 +118,12 @@ python3 bench/run_bench.py --totals 1024,4096,8192 --chunks 200,500
 
 python3 bench/run_bench.py --quick                 # 200MB smoke run
 python3 bench/run_bench.py --repeat 5 --json out.json   # median of 5, dump raw
+python3 bench/run_bench.py --null-pct 30            # OPTIONAL columns, ~30% nulls
+python3 bench/run_bench.py --no-strings             # numeric-only (no dictionary)
 ```
+
+`--null-pct N` makes every column nullable (OPTIONAL) with ~N% randomly-placed
+nulls, exercising the definition-level path on both writers.
 
 Each output file is deleted after measuring, so transient disk stays bounded by a
 single dataset (≤ the largest `--totals` entry). Use `--repeat N` to report the
@@ -186,5 +195,9 @@ Each prints one JSON line: `gen_s`, `write_s`, `write_gbps`, `mrows_per_s`,
 - **Strings (dictionary)**: with `level`/`path` drawn from small pools, both
   writers emit RLE_DICTIONARY and land within ~0.1% on size; n2p's dictionary
   builder keeps write speed on par with (often slightly ahead of) Arrow.
+- **Nulls (`--null-pct`)**: OPTIONAL columns add a 1-bit-per-row definition-level
+  section per page. n2p stays on par-to-faster than Arrow and, at e.g. 30% nulls,
+  a touch smaller — it writes only the present values plus the (zstd-friendly)
+  def-level bitmap.
 - **Peak RSS** tracks the chunk size, not the dataset total — the point of the
   streaming design.

@@ -77,9 +77,10 @@ def gather_meta():
 
 
 def render(results, meta):
-    # Pair n2p and arrow rows by (total, chunk, codec, strings).
+    # Pair n2p and arrow rows by (total, chunk, codec, strings, null_pct).
     def key(r):
-        return (r["total_mb"], r["chunk_mb"], r["codec"], r.get("strings", True))
+        return (r["total_mb"], r["chunk_mb"], r["codec"],
+                r.get("strings", True), r.get("null_pct", 0))
 
     pairs = {}
     for r in results:
@@ -102,12 +103,13 @@ def render(results, meta):
     out.append("- **Phases:** write only (data generation excluded); ZSTD level 3; "
                "one row group per chunk; streamed so peak RSS ≈ one chunk.")
     out.append("")
-    out.append("| total | chunk | codec | n2p GB/s | arrow GB/s | n2p write | "
+    out.append("| total | chunk | codec | nulls | n2p GB/s | arrow GB/s | n2p write | "
                "n2p file | arrow file | n2p/arrow size | peak RSS (n2p/arrow) |")
-    out.append("|---:|---:|:--|---:|---:|:--:|---:|---:|:--:|:--:|")
+    out.append("|---:|---:|:--|---:|---:|---:|:--:|---:|---:|:--:|:--:|")
 
     for k in sorted(pairs):
-        total, chunk, codec, _ = k
+        total, chunk, codec, _, null_pct = k
+        nulls = f"{null_pct}%"
         n = pairs[k].get("n2p")
         a = pairs[k].get("arrow")
         if not n:
@@ -115,13 +117,13 @@ def render(results, meta):
         if a:
             spd = a["write_s"] / n["write_s"] if n["write_s"] else 0
             sz = n["file_bytes"] / a["file_bytes"] if a["file_bytes"] else 0
-            row = (f"| {total} MB | {chunk} MB | {codec} | "
+            row = (f"| {total} MB | {chunk} MB | {codec} | {nulls} | "
                    f"{n['write_gbps']:.3f} | {a['write_gbps']:.3f} | "
                    f"**{spd:.2f}×** | {n['file_bytes']/2**20:.1f} MB | "
                    f"{a['file_bytes']/2**20:.1f} MB | {sz:.3f}× | "
                    f"{n['peak_rss_mb']:.0f}/{a['peak_rss_mb']:.0f} MB |")
         else:
-            row = (f"| {total} MB | {chunk} MB | {codec} | {n['write_gbps']:.3f} | "
+            row = (f"| {total} MB | {chunk} MB | {codec} | {nulls} | {n['write_gbps']:.3f} | "
                    f"— | — | {n['file_bytes']/2**20:.1f} MB | — | — | "
                    f"{n['peak_rss_mb']:.0f} MB |")
         out.append(row)

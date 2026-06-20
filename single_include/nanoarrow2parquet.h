@@ -28,15 +28,19 @@
 // pandas / pyarrow / DuckDB / polars.
 //
 // Scope (v1):
-//   * fixed-width, REQUIRED (non-nullable), flat columns: int8/16/32/64,
-//     uint8/16/32/64, float, double, bool, fixed_size_binary(N) -- PLAIN encoded.
+//   * fixed-width flat columns: int8/16/32/64, uint8/16/32/64, float, double,
+//     bool, fixed_size_binary(N) -- PLAIN encoded.
 //   * variable-width strings/binary (utf8/large_utf8/binary/large_binary) via
 //     dictionary encoding (RLE_DICTIONARY).
+//   * nullable (OPTIONAL) columns: a column whose Arrow schema sets
+//     ARROW_FLAG_NULLABLE is written with definition levels; the Arrow null
+//     type ("n") becomes an all-null column. REQUIRED columns (non-nullable
+//     schema) keep the zero-overhead fast path and reject actual nulls.
 //   * every page body is compressed (ZSTD by default).
 //   * one or more row groups (streaming writer).
 //
-// Out of scope (documented TODO): nullable / definition levels, nested
-// list/struct/map columns, page statistics / indexes, bloom filters.
+// Out of scope (documented TODO): nested list/struct/map columns, page
+// statistics / indexes, bloom filters.
 
 #include <stddef.h>
 
@@ -411,6 +415,25 @@ inline std::vector<std::uint8_t> encode_rle_dictionary_indices(
     return out;
 }
 
+// Encode a definition-level sequence for a flat OPTIONAL column (max def level 1,
+// so bit_width 1) as the leading bytes of a DataPage V1 body: a 4-byte
+// little-endian length followed by the RLE/bit-pack-hybrid run. `levels[i]` is 1
+// for a present value and 0 for a null. Reuses the same single bit-packed run as
+// the dictionary indices -- 1 bit/level, which page compression then collapses
+// (an all-present column's levels compress to almost nothing).
+inline std::vector<std::uint8_t> encode_definition_levels(
+    std::span<const std::uint32_t> levels, int bit_width) {
+    const std::vector<std::uint8_t> run = encode_rle_dictionary_indices(levels, bit_width);
+    std::vector<std::uint8_t> out;
+    const std::uint32_t len = static_cast<std::uint32_t>(run.size());
+    out.push_back(len & 0xFF);
+    out.push_back((len >> 8) & 0xFF);
+    out.push_back((len >> 16) & 0xFF);
+    out.push_back((len >> 24) & 0xFF);
+    out.insert(out.end(), run.begin(), run.end());
+    return out;
+}
+
 }  // namespace n2p
 
 // ---- src/compress.hpp --------
@@ -466,7 +489,7 @@ namespace {
 
 // ---- column type mapping -------------------------------------------------
 
-enum class Extract { MemcpyFixed, WidenInt, Bool, ByteArray };
+enum class Extract { MemcpyFixed, WidenInt, Bool, ByteArray, Null };
 
 struct ColumnSpec {
     std::string name;
@@ -478,14 +501,23 @@ struct ColumnSpec {
     int src_width = 0;     // MemcpyFixed: element bytes; WidenInt: 1 or 2
     bool sign_extend = false;  // WidenInt
     bool large_offsets = false;  // ByteArray: 64-bit offsets
+    bool nullable = false;  // OPTIONAL column -> definition levels in each page
 };
 
-// Parse an Arrow C format string into a ColumnSpec. Returns std::nullopt for
-// unsupported types (the caller emits N2P_UNSUPPORTED_TYPE).
+// Parse an Arrow C format string into a ColumnSpec. `nullable` comes from the
+// Arrow schema's ARROW_FLAG_NULLABLE. Returns std::nullopt for unsupported types
+// (the caller emits N2P_UNSUPPORTED_TYPE).
 std::optional<ColumnSpec> map_format(const char* format, std::string name,
-                                     std::string& err) {
+                                     bool nullable, std::string& err) {
     ColumnSpec s;
     s.name = std::move(name);
+    s.nullable = nullable;
+    if (std::strcmp(format, "n") == 0) {  // null type: every value is null
+        s.type = pq::Type::Int32;
+        s.extract = Extract::Null;
+        s.nullable = true;  // an all-null column is inherently OPTIONAL
+        return s;
+    }
     auto fixed = [&](pq::Type t, int width) {
         s.type = t;
         s.extract = Extract::MemcpyFixed;
@@ -578,38 +610,77 @@ void append_le(std::vector<std::uint8_t>& out, std::uint32_t v) {
     out.push_back((v >> 16) & 0xFF); out.push_back((v >> 24) & 0xFF);
 }
 
-std::vector<std::uint8_t> build_plain_fixed(const ArrowArray& arr, const ColumnSpec& s) {
+// Arrow validity bitmap is LSB-first, 1 == valid. A null bitmap pointer means the
+// column has no nulls (every value valid).
+inline bool valid_bit(const std::uint8_t* validity, std::size_t i) {
+    return validity == nullptr || ((validity[i >> 3] >> (i & 7)) & 1);
+}
+
+// PLAIN body. For an OPTIONAL column with nulls (`validity` non-null) only the
+// present values are emitted, as Parquet requires; pass validity == nullptr for
+// the REQUIRED / no-null fast path (a plain memcpy for fixed-width).
+std::vector<std::uint8_t> build_plain_fixed(const ArrowArray& arr, const ColumnSpec& s,
+                                            const std::uint8_t* validity) {
     const auto n = static_cast<std::size_t>(arr.length);
     const auto* src = static_cast<const std::uint8_t*>(arr.buffers[1]);
     std::vector<std::uint8_t> body;
+    auto append_widened = [&](std::size_t i) {
+        std::int32_t v = 0;
+        if (s.src_width == 1) {
+            v = s.sign_extend ? static_cast<std::int32_t>(static_cast<std::int8_t>(src[i]))
+                              : static_cast<std::int32_t>(src[i]);
+        } else {  // 2 bytes LE
+            const std::uint16_t raw = static_cast<std::uint16_t>(src[2 * i]) |
+                                      (static_cast<std::uint16_t>(src[2 * i + 1]) << 8);
+            v = s.sign_extend ? static_cast<std::int32_t>(static_cast<std::int16_t>(raw))
+                              : static_cast<std::int32_t>(raw);
+        }
+        append_le(body, static_cast<std::uint32_t>(v));
+    };
     if (s.extract == Extract::MemcpyFixed) {
-        const std::size_t bytes = n * static_cast<std::size_t>(s.src_width);
-        body.assign(src, src + bytes);
+        const std::size_t w = static_cast<std::size_t>(s.src_width);
+        if (validity == nullptr) {
+            body.assign(src, src + n * w);  // fast path: byte-identical to Arrow
+        } else {
+            body.reserve(n * w);
+            for (std::size_t i = 0; i < n; ++i)
+                if (valid_bit(validity, i)) body.insert(body.end(), src + i * w, src + (i + 1) * w);
+        }
     } else {  // WidenInt -> INT32
         body.reserve(n * 4);
-        for (std::size_t i = 0; i < n; ++i) {
-            std::int32_t v = 0;
-            if (s.src_width == 1) {
-                v = s.sign_extend ? static_cast<std::int32_t>(static_cast<std::int8_t>(src[i]))
-                                  : static_cast<std::int32_t>(src[i]);
-            } else {  // 2 bytes LE
-                const std::uint16_t raw = static_cast<std::uint16_t>(src[2 * i]) |
-                                          (static_cast<std::uint16_t>(src[2 * i + 1]) << 8);
-                v = s.sign_extend ? static_cast<std::int32_t>(static_cast<std::int16_t>(raw))
-                                  : static_cast<std::int32_t>(raw);
-            }
-            append_le(body, static_cast<std::uint32_t>(v));
-        }
+        for (std::size_t i = 0; i < n; ++i)
+            if (valid_bit(validity, i)) append_widened(i);
     }
     return body;
 }
 
-std::vector<std::uint8_t> build_plain_bool(const ArrowArray& arr) {
+std::vector<std::uint8_t> build_plain_bool(const ArrowArray& arr, const std::uint8_t* validity) {
     // Arrow bool data is bit-packed LSB-first -- identical to Parquet PLAIN bool.
     const auto n = static_cast<std::size_t>(arr.length);
     const auto* src = static_cast<const std::uint8_t*>(arr.buffers[1]);
-    const std::size_t bytes = (n + 7) / 8;
-    return std::vector<std::uint8_t>(src, src + bytes);
+    if (validity == nullptr) {
+        const std::size_t bytes = (n + 7) / 8;
+        return std::vector<std::uint8_t>(src, src + bytes);
+    }
+    // Re-pack only the present bits, tightly, into a fresh LSB-first bitmap.
+    std::vector<std::uint8_t> body;
+    std::size_t out_bit = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        if (!valid_bit(validity, i)) continue;
+        if ((out_bit & 7) == 0) body.push_back(0);
+        if ((src[i >> 3] >> (i & 7)) & 1) body.back() |= static_cast<std::uint8_t>(1u << (out_bit & 7));
+        ++out_bit;
+    }
+    return body;
+}
+
+// Definition levels for a flat OPTIONAL column: 1 = present, 0 = null.
+std::vector<std::uint8_t> build_def_levels(const std::uint8_t* validity, std::size_t n,
+                                           bool all_null = false) {
+    std::vector<std::uint32_t> levels(n);
+    for (std::size_t i = 0; i < n; ++i)
+        levels[i] = (all_null || !valid_bit(validity, i)) ? 0u : 1u;
+    return encode_definition_levels(levels, /*bit_width=*/1);
 }
 
 // Build the dictionary (PLAIN BYTE_ARRAY) page body and the RLE_DICTIONARY data
@@ -620,7 +691,8 @@ struct DictPages {
     std::size_t dict_size = 0;
 };
 
-DictPages build_dictionary_pages(const ArrowArray& arr, const ColumnSpec& s) {
+DictPages build_dictionary_pages(const ArrowArray& arr, const ColumnSpec& s,
+                                 const std::uint8_t* validity) {
     const auto n = static_cast<std::size_t>(arr.length);
     const auto* data = static_cast<const std::uint8_t*>(arr.buffers[2]);
 
@@ -637,19 +709,23 @@ DictPages build_dictionary_pages(const ArrowArray& arr, const ColumnSpec& s) {
                                 static_cast<std::size_t>(end - start));
     };
 
+    // Indices are emitted only for present rows (nulls are carried by the def
+    // levels), so this vector may be shorter than `n`.
     std::unordered_map<std::string_view, std::uint32_t> seen;
     std::vector<std::string_view> dict;
-    std::vector<std::uint32_t> indices(n);
+    std::vector<std::uint32_t> indices;
+    indices.reserve(n);
     for (std::size_t i = 0; i < n; ++i) {
+        if (!valid_bit(validity, i)) continue;
         const std::string_view v = value_at(i);
         auto it = seen.find(v);
         if (it == seen.end()) {
             const auto idx = static_cast<std::uint32_t>(dict.size());
             seen.emplace(v, idx);
             dict.push_back(v);
-            indices[i] = idx;
+            indices.push_back(idx);
         } else {
-            indices[i] = it->second;
+            indices.push_back(it->second);
         }
     }
 
@@ -760,10 +836,11 @@ bool validate_child(const ArrowArray& child, const ColumnSpec& s,
         err = "column '" + s.name + "' has a non-zero array offset (slices unsupported)";
         return false;
     }
-    if (child.null_count > 0) {
-        err = "column '" + s.name + "' contains nulls (only REQUIRED columns are supported)";
+    if (child.null_count > 0 && !s.nullable) {
+        err = "column '" + s.name + "' contains nulls but its schema is not nullable";
         return false;
     }
+    if (s.extract == Extract::Null) return true;  // null type carries no buffers
     const std::int64_t need = (s.extract == Extract::ByteArray) ? 3 : 2;
     if (child.n_buffers < need || child.buffers == nullptr) {
         err = "column '" + s.name + "' is missing required buffers";
@@ -778,7 +855,8 @@ void serialize_schema_element(CompactWriter& w, const ColumnSpec& s) {
     if (s.type == pq::Type::FixedLenByteArray) {
         w.field_i32(2, s.type_length);
     }
-    w.field_i32(3, static_cast<std::int32_t>(pq::Repetition::Required));
+    w.field_i32(3, static_cast<std::int32_t>(s.nullable ? pq::Repetition::Optional
+                                                        : pq::Repetition::Required));
     w.field_string(4, s.name);
     if (s.has_converted) {
         w.field_i32(6, static_cast<std::int32_t>(s.converted));
@@ -864,7 +942,8 @@ int write_one_batch(N2PWriter& w, const ArrowSchema* schema, const ArrowArray* b
         const ArrowSchema* child = schema->children[i];
         std::string err;
         const char* name = child->name ? child->name : "";
-        auto spec = map_format(child->format, name, err);
+        const bool nullable = (child->flags & ARROW_FLAG_NULLABLE) != 0;
+        auto spec = map_format(child->format, name, nullable, err);
         if (!spec) {
             w.last_error = err;
             return N2P_UNSUPPORTED_TYPE;
@@ -899,8 +978,24 @@ int write_one_batch(N2PWriter& w, const ArrowSchema* schema, const ArrowArray* b
             c.num_values = batch->length;
             c.file_offset = w.offset;
 
+            // OPTIONAL columns carry a definition-level prefix on every data page
+            // (1 = present, 0 = null); the value section then holds only present
+            // values. `validity` is nullptr when the chunk has no nulls, keeping
+            // the REQUIRED-equivalent fast path.
+            const auto* validity =
+                (s.nullable && s.extract != Extract::Null && child->n_buffers > 0)
+                    ? static_cast<const std::uint8_t*>(child->buffers[0])
+                    : nullptr;
+            const bool has_nulls = (child->null_count != 0) && validity != nullptr;
+            std::vector<std::uint8_t> def_prefix;
+            if (s.nullable) {
+                def_prefix = build_def_levels(validity, static_cast<std::size_t>(batch->length),
+                                              /*all_null=*/s.extract == Extract::Null);
+            }
+            const std::uint8_t* value_validity = has_nulls ? validity : nullptr;
+
             if (s.extract == Extract::ByteArray) {
-                DictPages pages = build_dictionary_pages(*child, s);
+                DictPages pages = build_dictionary_pages(*child, s, value_validity);
                 // dictionary page
                 auto dict_comp = compress_page(pages.dict_body, w.codec);
                 auto dict_hdr = dictionary_page_header(
@@ -910,21 +1005,28 @@ int write_one_batch(N2PWriter& w, const ArrowSchema* schema, const ArrowArray* b
                 c.dictionary_page_offset = w.offset;
                 c.has_dictionary = true;
                 PageBytes dp = emit_page(w, dict_hdr, dict_comp, pages.dict_body.size());
-                // data page (RLE_DICTIONARY)
-                auto data_comp = compress_page(pages.data_body, w.codec);
+                // data page (RLE_DICTIONARY), def levels first.
+                std::vector<std::uint8_t> data_body = def_prefix;
+                data_body.insert(data_body.end(), pages.data_body.begin(), pages.data_body.end());
+                auto data_comp = compress_page(data_body, w.codec);
                 auto data_hdr = data_page_header(
                     static_cast<std::int32_t>(batch->length), pq::Encoding::RleDictionary,
-                    static_cast<std::int32_t>(pages.data_body.size()),
+                    static_cast<std::int32_t>(data_body.size()),
                     static_cast<std::int32_t>(data_comp.size()));
                 c.data_page_offset = w.offset;
-                PageBytes vp = emit_page(w, data_hdr, data_comp, pages.data_body.size());
+                PageBytes vp = emit_page(w, data_hdr, data_comp, data_body.size());
                 c.total_uncompressed = dp.uncompressed + vp.uncompressed;
                 c.total_compressed = dp.on_disk + vp.on_disk;
                 c.encodings = {pq::Encoding::Plain, pq::Encoding::RleDictionary};
             } else {
-                std::vector<std::uint8_t> body =
-                    (s.extract == Extract::Bool) ? build_plain_bool(*child)
-                                                 : build_plain_fixed(*child, s);
+                std::vector<std::uint8_t> body = def_prefix;
+                if (s.extract == Extract::Bool) {
+                    auto v = build_plain_bool(*child, value_validity);
+                    body.insert(body.end(), v.begin(), v.end());
+                } else if (s.extract != Extract::Null) {  // Null type: no values
+                    auto v = build_plain_fixed(*child, s, value_validity);
+                    body.insert(body.end(), v.begin(), v.end());
+                }
                 auto comp = compress_page(body, w.codec);
                 auto hdr = data_page_header(
                     static_cast<std::int32_t>(batch->length), pq::Encoding::Plain,

@@ -25,12 +25,19 @@ The only real format work is a small Thrift *compact protocol* encoder
 
 **Supported (v1):**
 
-- Fixed-width, **REQUIRED (non-nullable)**, flat columns: `int8/16/32/64`,
-  `uint8/16/32/64`, `float`, `double`, `bool`, `fixed_size_binary(N)` — PLAIN.
+- Fixed-width flat columns: `int8/16/32/64`, `uint8/16/32/64`, `float`, `double`,
+  `bool`, `fixed_size_binary(N)` — PLAIN.
 - Variable-width strings/binary (`utf8`, `large_utf8`, `binary`, `large_binary`)
   via dictionary encoding (`RLE_DICTIONARY`).
+- **Nullable (OPTIONAL) columns**: a column whose Arrow schema sets
+  `ARROW_FLAG_NULLABLE` is written with definition levels (only present values are
+  stored); the Arrow null type (`n`) becomes an all-null column. Non-nullable
+  columns keep the zero-overhead REQUIRED fast path and reject actual nulls.
 - Per-page compression: ZSTD (default) or uncompressed.
 - One or more row groups via the streaming writer.
+
+This matches [nanolance](https://github.com/yoavbendor/nanolance)'s type coverage,
+so the same Arrow data feeds either writer (Parquet or Lance).
 
 | Arrow (C format) | Parquet physical | Notes |
 |---|---|---|
@@ -39,10 +46,11 @@ The only real format work is a small Thrift *compact protocol* encoder
 | `c` `s` `C` `S` | INT32 + `INT_8/16` / `UINT_8/16` | widened 1/2 → 4 bytes |
 | `w:N` | FIXED_LEN_BYTE_ARRAY (`type_length=N`) | memcpy |
 | `u` `U` `z` `Z` | BYTE_ARRAY via dictionary | `RLE_DICTIONARY` data page |
+| `n` | all-null INT32 | OPTIONAL, every value null |
+| any nullable | + definition levels | OPTIONAL repetition, present values only |
 
-**Out of scope (TODO):** nullable / definition levels, nested list/struct/map
-columns, page statistics / indexes, bloom filters, `DELTA_*` / `BYTE_STREAM_SPLIT`
-encodings.
+**Out of scope (TODO):** nested list/struct/map columns, page statistics /
+indexes, bloom filters, `DELTA_*` / `BYTE_STREAM_SPLIT` encodings.
 
 ## API
 

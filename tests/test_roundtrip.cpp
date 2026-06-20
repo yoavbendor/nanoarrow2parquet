@@ -162,13 +162,16 @@ void test_write_framing() {
     std::remove(path.c_str());
 }
 
-void test_rejects_nulls() {
+// Build a single INT32 column containing one value then one null. `nullable`
+// controls the schema flag; returns the writer status.
+int write_int32_with_null(bool nullable, const char* path) {
     ArrowSchema schema{};
     ArrowArray array{};
     ArrowSchemaInit(&schema);
     require(ArrowSchemaSetTypeStruct(&schema, 1) == NANOARROW_OK, "init struct");
     ArrowSchemaSetType(schema.children[0], NANOARROW_TYPE_INT32);
     ArrowSchemaSetName(schema.children[0], "x");
+    if (!nullable) schema.children[0]->flags = 0;  // REQUIRED
     require(ArrowArrayInitFromSchema(&array, &schema, nullptr) == NANOARROW_OK, "init array");
     ArrowArrayStartAppending(&array);
     ArrowArrayAppendInt(array.children[0], 1);
@@ -178,11 +181,22 @@ void test_rejects_nulls() {
     ArrowArrayFinishBuildingDefault(&array, nullptr);
 
     char err[256] = {0};
-    int status = n2p_write_file("should_not_exist.parquet", &schema, &array, err, sizeof err);
-    require(status == N2P_INVALID_ARGUMENT, "nullable column is rejected");
+    int status = n2p_write_file(path, &schema, &array, err, sizeof err);
     ArrowArrayRelease(&array);
     ArrowSchemaRelease(&schema);
+    return status;
+}
+
+void test_null_handling() {
+    // A REQUIRED (non-nullable) column with actual nulls is rejected.
+    int req = write_int32_with_null(/*nullable=*/false, "should_not_exist.parquet");
+    require(req == N2P_INVALID_ARGUMENT, "REQUIRED column with nulls is rejected");
     std::remove("should_not_exist.parquet");
+
+    // A nullable column with nulls is accepted (OPTIONAL, definition levels).
+    int opt = write_int32_with_null(/*nullable=*/true, "nullable_ok.parquet");
+    require(opt == N2P_OK, "nullable column with nulls is accepted");
+    std::remove("nullable_ok.parquet");
 }
 
 }  // namespace
@@ -194,7 +208,7 @@ int main() {
     test_bit_width();
     test_bit_pack();
     test_write_framing();
-    test_rejects_nulls();
+    test_null_handling();
     if (g_failures != 0) {
         std::fprintf(stderr, "%d check(s) failed\n", g_failures);
         return 1;

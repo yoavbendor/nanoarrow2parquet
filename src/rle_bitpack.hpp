@@ -81,4 +81,23 @@ inline std::vector<std::uint8_t> encode_rle_dictionary_indices(
     return out;
 }
 
+// Encode a definition-level sequence for a flat OPTIONAL column (max def level 1,
+// so bit_width 1) as the leading bytes of a DataPage V1 body: a 4-byte
+// little-endian length followed by the RLE/bit-pack-hybrid run. `levels[i]` is 1
+// for a present value and 0 for a null. Reuses the same single bit-packed run as
+// the dictionary indices -- 1 bit/level, which page compression then collapses
+// (an all-present column's levels compress to almost nothing).
+inline std::vector<std::uint8_t> encode_definition_levels(
+    std::span<const std::uint32_t> levels, int bit_width) {
+    const std::vector<std::uint8_t> run = encode_rle_dictionary_indices(levels, bit_width);
+    std::vector<std::uint8_t> out;
+    const std::uint32_t len = static_cast<std::uint32_t>(run.size());
+    out.push_back(len & 0xFF);
+    out.push_back((len >> 8) & 0xFF);
+    out.push_back((len >> 16) & 0xFF);
+    out.push_back((len >> 24) & 0xFF);
+    out.insert(out.end(), run.begin(), run.end());
+    return out;
+}
+
 }  // namespace n2p

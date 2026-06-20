@@ -10,15 +10,19 @@
 // pandas / pyarrow / DuckDB / polars.
 //
 // Scope (v1):
-//   * fixed-width, REQUIRED (non-nullable), flat columns: int8/16/32/64,
-//     uint8/16/32/64, float, double, bool, fixed_size_binary(N) -- PLAIN encoded.
+//   * fixed-width flat columns: int8/16/32/64, uint8/16/32/64, float, double,
+//     bool, fixed_size_binary(N) -- PLAIN encoded.
 //   * variable-width strings/binary (utf8/large_utf8/binary/large_binary) via
 //     dictionary encoding (RLE_DICTIONARY).
+//   * nullable (OPTIONAL) columns: a column whose Arrow schema sets
+//     ARROW_FLAG_NULLABLE is written with definition levels; the Arrow null
+//     type ("n") becomes an all-null column. REQUIRED columns (non-nullable
+//     schema) keep the zero-overhead fast path and reject actual nulls.
 //   * every page body is compressed (ZSTD by default).
 //   * one or more row groups (streaming writer).
 //
-// Out of scope (documented TODO): nullable / definition levels, nested
-// list/struct/map columns, page statistics / indexes, bloom filters.
+// Out of scope (documented TODO): nested list/struct/map columns, page
+// statistics / indexes, bloom filters.
 
 #include <stddef.h>
 
