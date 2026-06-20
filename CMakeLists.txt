@@ -208,6 +208,20 @@ if(N2P_BUILD_TESTS)
     add_executable(test_strings tests/test_strings.cpp)
     target_link_libraries(test_strings PRIVATE nanoarrow2parquet nanoarrow_static)
 
+    # Native struct-of-arrays path. Links only nanoarrow2parquet -- NOT nanoarrow --
+    # to prove the SoA front-end reaches Parquet without the Arrow C builders.
+    add_executable(test_soa tests/test_soa.cpp)
+    target_link_libraries(test_soa PRIVATE nanoarrow2parquet)
+
+    add_executable(test_soa_nullable tests/test_soa_nullable.cpp)
+    target_link_libraries(test_soa_nullable PRIVATE nanoarrow2parquet)
+
+    add_executable(test_soa_strings tests/test_soa_strings.cpp)
+    target_link_libraries(test_soa_strings PRIVATE nanoarrow2parquet)
+
+    add_executable(test_soa_bool tests/test_soa_bool.cpp)
+    target_link_libraries(test_soa_bool PRIVATE nanoarrow2parquet)
+
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
         add_test(NAME smoke_pyarrow
@@ -233,6 +247,30 @@ if(N2P_BUILD_TESTS)
                      "$<TARGET_FILE:test_strings> ${CMAKE_CURRENT_BINARY_DIR}/n2p_strings.parquet && \
                       ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_strings.py \
                       ${CMAKE_CURRENT_BINARY_DIR}/n2p_strings.parquet")
+
+        add_test(NAME soa_roundtrip
+                 COMMAND bash -c
+                     "$<TARGET_FILE:test_soa> ${CMAKE_CURRENT_BINARY_DIR}/n2p_soa.parquet && \
+                      ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_soa.py \
+                      ${CMAKE_CURRENT_BINARY_DIR}/n2p_soa.parquet")
+
+        add_test(NAME soa_nullable_roundtrip
+                 COMMAND bash -c
+                     "$<TARGET_FILE:test_soa_nullable> ${CMAKE_CURRENT_BINARY_DIR}/n2p_soa_nullable.parquet && \
+                      ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_soa_nullable.py \
+                      ${CMAKE_CURRENT_BINARY_DIR}/n2p_soa_nullable.parquet")
+
+        add_test(NAME soa_strings_roundtrip
+                 COMMAND bash -c
+                     "$<TARGET_FILE:test_soa_strings> ${CMAKE_CURRENT_BINARY_DIR}/n2p_soa_strings.parquet && \
+                      ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_soa_strings.py \
+                      ${CMAKE_CURRENT_BINARY_DIR}/n2p_soa_strings.parquet")
+
+        add_test(NAME soa_bool_roundtrip
+                 COMMAND bash -c
+                     "$<TARGET_FILE:test_soa_bool> ${CMAKE_CURRENT_BINARY_DIR}/n2p_soa_bool.parquet && \
+                      ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_soa_bool.py \
+                      ${CMAKE_CURRENT_BINARY_DIR}/n2p_soa_bool.parquet")
     endif()
 
     # Performance/size regression gate vs Apache Parquet C++. Only registered when
