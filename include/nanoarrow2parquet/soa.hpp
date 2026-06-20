@@ -24,9 +24,13 @@
 // packed into an Arrow validity bitmap -- or valid_bits(values, bitmap, nulls)
 // to alias a pre-packed LSB-first bitmap with no copy.
 //
+// Strings/binary: declare the field with the utf8 or binary tag and pass a range
+// of string-like values. These are not zero-copy -- the offsets and data buffers
+// are materialized per chunk -- but they need no Arrow structs from nanoarrow.
+//
 // Scope: REQUIRED or OPTIONAL fixed-width numeric columns (int8/16/32/64,
-// uint8/16/32/64, float, double). Strings/binary and nested structs are not yet
-// reachable from this path -- use the ArrowArray C API for those.
+// uint8/16/32/64, float, double) and utf8/binary columns. Nested structs are not
+// yet reachable from this path -- use the ArrowArray C API for those.
 
 #include "nanoarrow2parquet/nanoarrow2parquet.h"
 
@@ -103,8 +107,23 @@ N2P_SOA_TRAIT(float,         "f");
 N2P_SOA_TRAIT(double,        "g");
 #undef N2P_SOA_TRAIT
 
+// Variable-length field tags. Unlike the numeric types these are not zero-copy:
+// a SoA string column (range of string-like values) is materialized into Arrow
+// offsets + data buffers per chunk.
+struct utf8 {};    // -> BYTE_ARRAY annotated UTF8
+struct binary {};  // -> BYTE_ARRAY, no annotation
+
 template <class T>
-concept SupportedField = requires { arrow_traits<T>::format; };
+inline constexpr bool is_string_field_v = std::is_same_v<T, utf8> || std::is_same_v<T, binary>;
+
+template <class T>
+consteval const char* string_format() {
+    if constexpr (std::is_same_v<T, utf8>) return "u";
+    else return "z";
+}
+
+template <class T>
+concept SupportedField = (requires { arrow_traits<T>::format; }) || is_string_field_v<T>;
 
 // ---- field / schema description ------------------------------------------
 
@@ -191,7 +210,7 @@ template <class... Fields>
 class Writer {
     static_assert(sizeof...(Fields) > 0, "schema must have at least one field");
     static_assert((SupportedField<typename Fields::type> && ...),
-                  "every field type must be a supported fixed-width numeric type");
+                  "every field type must be a supported numeric type, utf8, or binary");
 
     static constexpr std::size_t K = sizeof...(Fields);
     template <std::size_t I>
@@ -262,12 +281,16 @@ private:
         }
         const auto n = static_cast<std::int64_t>(sizes[0]);
 
-        // Borrowed Arrow C views over the SoA storage (no copies, no nanoarrow).
+        // Borrowed Arrow C views over the SoA storage. Fixed-width columns alias
+        // their storage (no copy); string columns materialize offsets + data into
+        // the owned stores below, which outlive the write_batch call.
         ArrowSchema cs[K]{};
         ArrowArray ca[K]{};
-        const void* cb[K][2]{};
+        const void* cb[K][3]{};
         ArrowSchema* csp[K]{};
         ArrowArray* cap[K]{};
+        std::array<std::vector<std::uint8_t>, K> off_store;   // string offsets (int32)
+        std::array<std::vector<std::uint8_t>, K> data_store;  // string bytes
 
         auto setup = [&]<std::size_t J, class Col>(std::integral_constant<std::size_t, J>,
                                                    const Col& col) {
@@ -289,18 +312,45 @@ private:
                 validity = col.validity();
                 null_count = col.null_count;
             }
+            auto present_at = [&](std::size_t i) {
+                return validity == nullptr || ((validity[i >> 3] >> (i & 7)) & 1);
+            };
 
-            static_assert(std::same_as<column_value_t<decltype(values)>, FT>,
-                          "SoA column element type does not match its field type");
-
-            cs[J].format = arrow_traits<FT>::format;
             cs[J].name = F::name.c_str();
             cs[J].flags = F::nullable ? ARROW_FLAG_NULLABLE : 0;
             cb[J][0] = validity;                                          // validity bitmap
-            cb[J][1] = static_cast<const void*>(std::ranges::data(values));
             ca[J].length = n;
             ca[J].null_count = null_count;
-            ca[J].n_buffers = 2;
+
+            if constexpr (is_string_field_v<FT>) {
+                static_assert(std::convertible_to<column_value_t<decltype(values)>, std::string_view>,
+                              "string/binary column must be a range of string-like values");
+                auto& off = off_store[J];
+                auto& dat = data_store[J];
+                off.resize(sizeof(std::int32_t) * (static_cast<std::size_t>(n) + 1));
+                auto* o = reinterpret_cast<std::int32_t*>(off.data());
+                std::int32_t cur = 0;
+                o[0] = 0;
+                std::size_t i = 0;
+                for (auto&& e : values) {
+                    if (present_at(i)) {
+                        std::string_view sv(e);
+                        dat.insert(dat.end(), sv.begin(), sv.end());
+                        cur += static_cast<std::int32_t>(sv.size());
+                    }
+                    o[++i] = cur;
+                }
+                cs[J].format = string_format<FT>();
+                cb[J][1] = off.data();                                    // offsets
+                cb[J][2] = dat.data();                                    // data
+                ca[J].n_buffers = 3;
+            } else {
+                static_assert(std::same_as<column_value_t<decltype(values)>, FT>,
+                              "SoA column element type does not match its field type");
+                cs[J].format = arrow_traits<FT>::format;
+                cb[J][1] = static_cast<const void*>(std::ranges::data(values));
+                ca[J].n_buffers = 2;
+            }
             ca[J].buffers = cb[J];
             csp[J] = &cs[J];
             cap[J] = &ca[J];
