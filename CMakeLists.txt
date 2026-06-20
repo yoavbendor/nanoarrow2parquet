@@ -208,6 +208,11 @@ if(N2P_BUILD_TESTS)
     add_executable(test_strings tests/test_strings.cpp)
     target_link_libraries(test_strings PRIVATE nanoarrow2parquet nanoarrow_static)
 
+    # Native struct-of-arrays path. Links only nanoarrow2parquet -- NOT nanoarrow --
+    # to prove the SoA front-end reaches Parquet without the Arrow C builders.
+    add_executable(test_soa tests/test_soa.cpp)
+    target_link_libraries(test_soa PRIVATE nanoarrow2parquet)
+
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
         add_test(NAME smoke_pyarrow
@@ -233,6 +238,12 @@ if(N2P_BUILD_TESTS)
                      "$<TARGET_FILE:test_strings> ${CMAKE_CURRENT_BINARY_DIR}/n2p_strings.parquet && \
                       ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_strings.py \
                       ${CMAKE_CURRENT_BINARY_DIR}/n2p_strings.parquet")
+
+        add_test(NAME soa_roundtrip
+                 COMMAND bash -c
+                     "$<TARGET_FILE:test_soa> ${CMAKE_CURRENT_BINARY_DIR}/n2p_soa.parquet && \
+                      ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_soa.py \
+                      ${CMAKE_CURRENT_BINARY_DIR}/n2p_soa.parquet")
     endif()
 
     # Performance/size regression gate vs Apache Parquet C++. Only registered when

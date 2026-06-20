@@ -117,6 +117,30 @@ char err[256];
 n2p_write_file("out.parquet", &schema, &batch, err, sizeof err);
 ```
 
+### Native SoA path (compile-time schema)
+
+For SoA storage you can skip the Arrow C structs entirely. The header-only
+[`nanoarrow2parquet/soa.hpp`](include/nanoarrow2parquet/soa.hpp) takes the schema
+as C++ types and one contiguous range per column; for fixed-width columns the page
+body is the column's own storage (zero copy), and **no nanoarrow is involved** — it
+fills borrowed Arrow C *views* and drives the same page/footer back-end. Unsupported
+types, duplicate names, and column/field type mismatches are `static_assert`s.
+
+```cpp
+#include "nanoarrow2parquet/soa.hpp"
+using namespace n2p::soa;
+
+Writer<Field<"id", std::int64_t>, Field<"x", double>> w("out.parquet");
+w.write_chunk(ids, xs);     // one row group per call -- caller owns batching
+w.write_chunk(more_ids, more_xs);
+w.close();
+```
+
+Each `write_chunk` is exactly one row group, so the producer keeps batching policy
+and the writer never buffers the whole dataset. v0 covers REQUIRED fixed-width
+numeric columns; nullable, string, and nested columns still go through the
+`ArrowArray` API above.
+
 ## Single-header build
 
 The library is also published as one self-contained, STB-style header at
