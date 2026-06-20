@@ -74,6 +74,20 @@ if (n2p_write_file("out.parquet", &schema, &batch, err, sizeof err) != N2P_OK) {
 }
 ```
 
+### Example: pcapng → Parquet
+
+[`examples/pcapng2parquet.cpp`](examples/pcapng2parquet.cpp) is a self-contained
+pcap/pcapng → Parquet converter (the write-only counterpart to nanolance's
+`pcapng2lance`). It streams the all-scalar L1 packet-metadata table — `packet_id`,
+`interface_id`, `ts_raw`, `caplen`, `origlen`, `link_type`, `ts_resol`,
+`epb_flags` — flushing one row group per `--window-rows`, with `-d/-c` packet
+slicing. See [`examples/pcapng2parquet.md`](examples/pcapng2parquet.md).
+
+```sh
+cmake --build build --target pcapng2parquet
+./build/pcapng2parquet capture.pcapng packets.parquet
+```
+
 ### With soatins (nanotins)
 
 `soatins::arrow_schema<T>()` + `soatins::to_arrow(soa, batch)` already produce
@@ -153,6 +167,31 @@ is pinned to the same commit nanolance uses. Embedding parents that already prov
 - `smoke_pyarrow` — writes single-shot and 3-row-group files via the demo, then
   reads them back with pyarrow (and pandas/polars if installed) and asserts the
   values, dtypes, ZSTD codec, dictionary encoding, and row-group count.
+
+## Benchmarks
+
+[`bench/`](bench/) compares write throughput and output size against the Apache
+Parquet C++ writer, streaming datasets in chunks (row groups) so the total exceeds
+peak memory. Data generation is timed separately from writing, and the Apache
+baseline is configured to match n2p's choices (PLAIN, ZSTD level 3, one row group
+per chunk). The Arrow side links the `libparquet` bundled in pyarrow, so no Arrow
+source build is needed. See [`bench/README.md`](bench/README.md).
+
+```sh
+cmake -S . -B build -DN2P_BUILD_BENCHMARKS=ON
+cmake --build build --target bench_n2p bench_arrow
+python3 bench/run_bench.py --totals 1024,4096,8192 --chunks 200,500
+```
+
+At parity settings, ZSTD speed/size land within ~1% of Arrow (both bottleneck on
+zstd), while n2p's near-`memcpy` uncompressed path writes faster with near-zero
+size overhead and lower peak RSS.
+
+The same harness doubles as a **regression gate** (`run_bench.py --check`): it
+compares n2p to Apache Parquet C++ on the same runner and fails if write time or
+file size drifts beyond a ratio threshold — registered as the `bench_regression`
+CTest and run in CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) so new
+features / data types can't silently regress speed or size.
 
 ## License
 
