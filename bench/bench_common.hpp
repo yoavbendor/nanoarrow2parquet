@@ -83,11 +83,15 @@ struct Config {
     std::uint64_t chunk_mb = 200;
     bool compress = true;
     bool strings = true;             // include the dictionary-encoded string cols
+    bool wide = false;               // include the extra-type columns (see below)
     int null_pct = 0;                // 0 = REQUIRED columns; >0 = OPTIONAL w/ nulls
     std::string out = "/tmp/n2p_bench.parquet";
 
     bool nullable() const { return null_pct > 0; }
-    int num_cols() const { return strings ? 5 : 3; }
+    // base: id,value,category (3). +2 strings. +6 wide:
+    //   small (int8), small16 (int16), ucount (uint32), subtotal (uint64),
+    //   ratio (float), flag (bool) -- exercise widening, unsigned, float32, bool.
+    int num_cols() const { return 3 + (strings ? 2 : 0) + (wide ? 6 : 0); }
 
     // Estimated bytes/row for chunk sizing: fixed widths plus, for string columns,
     // the average value length + a 4-byte offset entry.
@@ -97,6 +101,7 @@ struct Config {
             b += avg_len(level_pool()) + 4;
             b += avg_len(path_pool()) + 4;
         }
+        if (wide) b += 1 + 2 + 4 + 8 + 4 + 0.125;  // int8/16 + u32 + u64 + f32 + bool bit
         return b;
     }
     std::uint64_t rows_per_chunk() const {
@@ -120,6 +125,8 @@ inline Config parse_config(int argc, char** argv, const char* default_out) {
         else if (a == "--codec") { std::string v = next(); c.compress = (v != "uncompressed" && v != "none"); }
         else if (a == "--strings") c.strings = true;
         else if (a == "--no-strings") c.strings = false;
+        else if (a == "--wide") c.wide = true;
+        else if (a == "--no-wide") c.wide = false;
         else if (a == "--null-pct") c.null_pct = static_cast<int>(std::strtoul(next(), nullptr, 10));
         else if (a == "--out") c.out = next();
         else { std::fprintf(stderr, "unknown flag: %s\n", a.c_str()); std::exit(2); }
@@ -280,9 +287,18 @@ inline void make_schema(const Config& cfg, ArrowSchema* out) {
     out->children[0] = detail::make_schema_child("l", "id", nul);
     out->children[1] = detail::make_schema_child("g", "value", nul);
     out->children[2] = detail::make_schema_child("i", "category", nul);
+    int k = 3;
     if (cfg.strings) {
-        out->children[3] = detail::make_schema_child("u", "level", nul);
-        out->children[4] = detail::make_schema_child("u", "path", nul);
+        out->children[k++] = detail::make_schema_child("u", "level", nul);
+        out->children[k++] = detail::make_schema_child("u", "path", nul);
+    }
+    if (cfg.wide) {
+        out->children[k++] = detail::make_schema_child("c", "small", nul);    // int8
+        out->children[k++] = detail::make_schema_child("s", "small16", nul);  // int16
+        out->children[k++] = detail::make_schema_child("I", "ucount", nul);   // uint32
+        out->children[k++] = detail::make_schema_child("L", "subtotal", nul); // uint64
+        out->children[k++] = detail::make_schema_child("f", "ratio", nul);    // float
+        out->children[k++] = detail::make_schema_child("b", "flag", nul);     // bool
     }
     out->dictionary = nullptr; out->release = detail::release_schema; out->private_data = nullptr;
 }
@@ -324,6 +340,7 @@ inline std::uint64_t make_chunk_array(const Config& cfg, std::uint64_t seed,
     children[1] = detail::make_fixed_child(static_cast<std::int64_t>(n), v1, n1, value);
     children[2] = detail::make_fixed_child(static_cast<std::int64_t>(n), v2, n2, category);
 
+    int k = 3;
     if (cfg.strings) {
         std::int32_t* loff; char* ldat;
         std::int32_t* poff; char* pdat;
@@ -334,8 +351,38 @@ inline std::uint64_t make_chunk_array(const Config& cfg, std::uint64_t seed,
         std::int64_t n3, n4;
         std::uint8_t* v3 = vbuf(&n3);
         std::uint8_t* v4 = vbuf(&n4);
-        children[3] = detail::make_string_child(static_cast<std::int64_t>(n), v3, n3, loff, ldat);
-        children[4] = detail::make_string_child(static_cast<std::int64_t>(n), v4, n4, poff, pdat);
+        children[k++] = detail::make_string_child(static_cast<std::int64_t>(n), v3, n3, loff, ldat);
+        children[k++] = detail::make_string_child(static_cast<std::int64_t>(n), v4, n4, poff, pdat);
+    }
+
+    if (cfg.wide) {
+        auto* i8 = static_cast<std::int8_t*>(std::malloc(n));
+        auto* i16 = static_cast<std::int16_t*>(std::malloc(n * sizeof(std::int16_t)));
+        auto* u32 = static_cast<std::uint32_t*>(std::malloc(n * sizeof(std::uint32_t)));
+        auto* u64 = static_cast<std::uint64_t*>(std::malloc(n * sizeof(std::uint64_t)));
+        auto* f32 = static_cast<float*>(std::malloc(n * sizeof(float)));
+        auto* flag = static_cast<std::uint8_t*>(std::calloc((n + 7) / 8, 1));  // bit-packed
+        if (!i8 || !i16 || !u32 || !u64 || !f32 || !flag) { std::fprintf(stderr, "OOM wide\n"); std::exit(1); }
+        for (std::uint64_t i = 0; i < n; ++i) {
+            const std::uint64_t r = rng.next();
+            i8[i] = static_cast<std::int8_t>(r);
+            i16[i] = static_cast<std::int16_t>(r >> 8);
+            u32[i] = static_cast<std::uint32_t>(r);
+            u64[i] = r;
+            f32[i] = static_cast<float>(r % 100000ull) * 0.01f;
+            if (r & 1) flag[i >> 3] |= static_cast<std::uint8_t>(1u << (i & 7));
+        }
+        owner->allocs.insert(owner->allocs.end(), {i8, i16, u32, u64, f32, flag});
+        bytes += n * (1 + 2 + 4 + 8 + 4) + (n + 7) / 8;
+        std::int64_t ns[6];
+        std::uint8_t* vs[6];
+        for (int c = 0; c < 6; ++c) vs[c] = vbuf(&ns[c]);
+        children[k++] = detail::make_fixed_child(static_cast<std::int64_t>(n), vs[0], ns[0], i8);
+        children[k++] = detail::make_fixed_child(static_cast<std::int64_t>(n), vs[1], ns[1], i16);
+        children[k++] = detail::make_fixed_child(static_cast<std::int64_t>(n), vs[2], ns[2], u32);
+        children[k++] = detail::make_fixed_child(static_cast<std::int64_t>(n), vs[3], ns[3], u64);
+        children[k++] = detail::make_fixed_child(static_cast<std::int64_t>(n), vs[4], ns[4], f32);
+        children[k++] = detail::make_fixed_child(static_cast<std::int64_t>(n), vs[5], ns[5], flag);
     }
 
     auto** buffers = static_cast<const void**>(std::malloc(sizeof(void*)));
@@ -367,13 +414,13 @@ inline void print_result(const Result& r) {
     const double write_gbs = r.write_s > 0 ? gb / r.write_s : 0.0;
     const double mrows = r.rows / 1e6;
     std::printf(
-        "{\"lib\":\"%s\",\"codec\":\"%s\",\"strings\":%s,\"null_pct\":%d,"
+        "{\"lib\":\"%s\",\"codec\":\"%s\",\"strings\":%s,\"wide\":%s,\"null_pct\":%d,"
         "\"total_mb\":%llu,\"chunk_mb\":%llu,"
         "\"rows\":%llu,\"chunks\":%llu,\"gen_s\":%.4f,\"write_s\":%.4f,"
         "\"write_gbps\":%.4f,\"mrows_per_s\":%.3f,\"file_bytes\":%llu,"
         "\"uncompressed_bytes\":%llu,\"bytes_per_row\":%.3f,\"peak_rss_mb\":%.1f}\n",
         r.lib, r.cfg.compress ? "zstd" : "uncompressed", r.cfg.strings ? "true" : "false",
-        r.cfg.null_pct,
+        r.cfg.wide ? "true" : "false", r.cfg.null_pct,
         (unsigned long long)r.cfg.total_mb, (unsigned long long)r.cfg.chunk_mb,
         (unsigned long long)r.rows, (unsigned long long)r.cfg.num_chunks(),
         r.gen_s, r.write_s, write_gbs, r.write_s > 0 ? mrows / r.write_s : 0.0,

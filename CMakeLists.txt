@@ -124,6 +124,12 @@ if(N2P_BUILD_BENCHMARKS)
     target_include_directories(bench_n2p PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/bench)
     target_link_libraries(bench_n2p PRIVATE nanoarrow2parquet nanoarrow_static)
 
+    # Compile-time SoA path benchmark. Links only nanoarrow2parquet (no nanoarrow),
+    # matching how the SoA front-end is meant to be consumed.
+    add_executable(bench_n2p_soa bench/bench_n2p_soa.cpp)
+    target_include_directories(bench_n2p_soa PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/bench)
+    target_link_libraries(bench_n2p_soa PRIVATE nanoarrow2parquet)
+
     # The Apache baseline links the Parquet C++ libraries. By default we discover
     # the ones bundled in an installed pyarrow wheel (headers + libarrow/libparquet
     # shared objects), which avoids building Arrow from source. Override with
@@ -204,6 +210,11 @@ if(N2P_BUILD_TESTS)
     add_executable(test_struct tests/test_struct.cpp)
     target_link_libraries(test_struct PRIVATE nanoarrow2parquet nanoarrow_static)
 
+    # Mixed-type wide table (uint8/16/32/64, float32/64) across the 16384 boundary,
+    # REQUIRED and nullable -- regression guard for the mixed-type corruption report.
+    add_executable(test_mixed_types tests/test_mixed_types.cpp)
+    target_link_libraries(test_mixed_types PRIVATE nanoarrow2parquet nanoarrow_static)
+
     # BYTE_ARRAY encoding chooser: PLAIN fallback vs RLE_DICTIONARY.
     add_executable(test_strings tests/test_strings.cpp)
     target_link_libraries(test_strings PRIVATE nanoarrow2parquet nanoarrow_static)
@@ -280,6 +291,14 @@ if(N2P_BUILD_TESTS)
                      "$<TARGET_FILE:test_soa_struct> ${CMAKE_CURRENT_BINARY_DIR}/n2p_soa_struct.parquet && \
                       ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_soa_struct.py \
                       ${CMAKE_CURRENT_BINARY_DIR}/n2p_soa_struct.parquet")
+
+        add_test(NAME mixed_types_roundtrip
+                 COMMAND bash -c
+                     "$<TARGET_FILE:test_mixed_types> ${CMAKE_CURRENT_BINARY_DIR}/n2p_mixed.parquet \
+                      ${CMAKE_CURRENT_BINARY_DIR}/n2p_mixed_null.parquet && \
+                      ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_mixed_types.py \
+                      ${CMAKE_CURRENT_BINARY_DIR}/n2p_mixed.parquet \
+                      ${CMAKE_CURRENT_BINARY_DIR}/n2p_mixed_null.parquet")
     endif()
 
     # Performance/size regression gate vs Apache Parquet C++. Only registered when
