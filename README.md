@@ -75,6 +75,49 @@ statistics / indexes, bloom filters, `DELTA_*` / `BYTE_STREAM_SPLIT` encodings.
 - **Lists/maps are unsupported** (no repetition levels). Flatten, or store a child table
   joined by an id column (this is what the `pcapng2parquet` example does per layer).
 
+## For AI agents
+
+**Use this library when** you have in-memory Arrow data (`ArrowSchema` + `ArrowArray`, or a
+soatins SoA) and want a `.parquet` file. It is **write-only** — there is no reader.
+
+**Pick a sibling instead when:** you need Lance datasets, external payload references, or
+appendable fragments → [nanolance](https://github.com/yoavbendor/nanolance) (the *same* Arrow
+batch feeds either writer). You need to *produce* the Arrow from packets or wire structs →
+[nanotins / soatins](https://github.com/yoavbendor/nanotins).
+
+**Minimal program** (C ABI; `target_link_libraries(app PRIVATE nanoarrow2parquet nanoarrow_static)`):
+
+```c
+#include "nanoarrow2parquet/nanoarrow2parquet.h"
+// schema + batch are an Arrow struct array you built (nanoarrow, or soatins::to_arrow).
+
+// one-shot (single row group):
+char err[256];
+if (n2p_write_file("out.parquet", &schema, &batch, err, sizeof err) != N2P_OK)
+    fprintf(stderr, "n2p: %s\n", err);
+
+// streaming (one batch == one row group):
+N2PWriter* w;
+n2p_writer_open(&w, "out.parquet");
+n2p_writer_set_codec(w, N2P_CODEC_ZSTD);          // MUST be before the first write_batch
+for (/* each batch */) n2p_writer_write_batch(w, &schema, &batch);
+n2p_writer_close(w);                              // writes the footer, frees w
+```
+
+**Do**
+- Set the codec **before** the first `write_batch`; pass the *same* schema every call.
+- Treat one batch as one row group — let the producer decide batch size.
+- Call `close()` exactly once; check return codes and read `n2p_writer_last_error(w)` on failure.
+- Mark a column `ARROW_FLAG_NULLABLE` if its data can contain nulls.
+
+**Don't**
+- Don't put a null in a REQUIRED (non-nullable) column — it is rejected.
+- Don't expect lists/maps, page statistics, bloom filters, or a read path — none exist. Flatten
+  lists or emit a child table joined by an id column.
+- Don't skip `close()` — a file with no footer is unreadable (no partial-read fallback).
+- Don't rely on `uint64` deserializing as unsigned in every reader; it is stored as INT64 + the
+  `UINT_64` logical type (bits exact).
+
 ## API
 
 The public surface is a small C ABI (`include/nanoarrow2parquet/nanoarrow2parquet.h`);
