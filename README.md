@@ -59,6 +59,22 @@ so the same Arrow data feeds either writer (Parquet or Lance).
 **Out of scope (TODO):** nested list/map columns (repetition levels), page
 statistics / indexes, bloom filters, `DELTA_*` / `BYTE_STREAM_SPLIT` encodings.
 
+### Gotchas & limits
+
+- **Write-only.** There is no reader; round-trip with pyarrow/DuckDB/polars/lance.
+- **One record batch == one row group.** The producer controls batching; the writer
+  never buffers the whole dataset.
+- **Crash safety:** the footer is written only at `close()`. A file whose process died
+  before `close()` has no footer and is unreadable (no partial-read fallback) — roll to
+  a new file periodically for long captures.
+- **REQUIRED columns reject actual nulls.** A non-nullable Arrow schema with a null in
+  the data is an error; mark the field `ARROW_FLAG_NULLABLE` (definition levels) if it
+  can be null.
+- **`uint64` is written as INT64 + the `UINT_64` logical type** (bits identical). Some
+  readers surface it as signed if they ignore the logical type — values are exact.
+- **Lists/maps are unsupported** (no repetition levels). Flatten, or store a child table
+  joined by an id column (this is what the `pcapng2parquet` example does per layer).
+
 ## API
 
 The public surface is a small C ABI (`include/nanoarrow2parquet/nanoarrow2parquet.h`);
@@ -89,18 +105,23 @@ if (n2p_write_file("out.parquet", &schema, &batch, err, sizeof err) != N2P_OK) {
 }
 ```
 
-### Example: pcapng → Parquet
+### Example: pcapng → Parquet (full protocol parsing)
 
-[`examples/pcapng2parquet.cpp`](examples/pcapng2parquet.cpp) is a self-contained
-pcap/pcapng → Parquet converter (the write-only counterpart to nanolance's
-`pcapng2lance`). It streams the all-scalar L1 packet-metadata table — `packet_id`,
-`interface_id`, `ts_raw`, `caplen`, `origlen`, `link_type`, `ts_resol`,
-`epb_flags` — flushing one row group per `--window-rows`, with `-d/-c` packet
-slicing. See [`examples/pcapng2parquet.md`](examples/pcapng2parquet.md).
+[`examples/pcapng2parquet`](examples/pcapng2parquet/) is a full pcap/pcapng → Parquet
+converter — the Parquet-output twin of nanolance's `pcapng2lance`. It runs the *same*
+header-only [nanotins](https://github.com/yoavbendor/nanotins) parsing stack (vendored
+as a git submodule) and writes **one table per layer**: L1 packets plus, with
+`--decode-l2l3`, ethernet / vlan / ipv4 / ipv6 / tcp / udp / **PTP** (+ bodies) / IPv6
+extension headers / SOME/IP, and with `--lldp` an LLDP TLV table. Only the output
+endpoint differs from `pcapng2lance` — both sinks consume the identical
+`ArrowSchema`/`ArrowArray`, so the per-PDU tables are byte-for-byte the same columns.
+It is deliberately **parse-only** (Parquet has no external blob store): payloads are
+not stored. See [`examples/pcapng2parquet/README.md`](examples/pcapng2parquet/README.md).
 
 ```sh
+git submodule update --init --recursive
 cmake --build build --target pcapng2parquet
-./build/pcapng2parquet capture.pcapng packets.parquet
+./build/pcapng2parquet --decode-l2l3 capture.pcapng out   # -> out_packets.parquet, out_ipv4.parquet, ...
 ```
 
 ### With soatins (nanotins)
