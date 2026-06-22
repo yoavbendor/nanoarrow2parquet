@@ -12,6 +12,32 @@ output endpoint changes** — `nanoarrow2parquet` instead of `nanolance`. Both s
 `ArrowSchema` / `ArrowArray`, so the per-PDU tables carry byte-for-byte the same columns; only the file
 format differs.
 
+## For AI agents
+
+**Use this example when** you want Parquet files from a capture (to analyze in pandas / pyarrow / DuckDB)
+and you do **not** need packet payloads. It is parse-only.
+
+**Pick a sibling instead when:** you need payloads kept external (uri+offset+size), `--stage` enrichment,
+or a Lance dataset → [`pcapng2lance`](https://github.com/yoavbendor/nanolance/tree/main/examples/pcapng2lance).
+You just want to eyeball decoded packets as text →
+[`pcapng2json`](https://github.com/yoavbendor/nanotins/tree/main/examples/pcapng2json).
+
+**Run:** `build/pcapng2parquet --decode-l2l3 capture.pcapng out` → `out_packets.parquet`, `out_ipv4.parquet`, …
+
+**Do**
+- Pass `--decode-l2l3` to get the per-PDU tables; without it you only get the L1 `_packets` table.
+- Join every PDU table back to `<stem>_packets.parquet` on `packet_id`.
+- Use `--window-bytes N` to bound RAM on large captures (one row group per window; slices stitch via the
+  global `packet_id`).
+- `git submodule update --init --recursive` first — nanotins is vendored under `extern/nanotins`.
+
+**Don't**
+- Don't look for `payload_ref` / `remainder_after_l4` tables or `--stage` — Parquet has no blob store; use
+  `pcapng2lance` for those.
+- Don't expect the variable-length child tables (SRv6 segments, IPv4/IPv6 options) — out of scope here
+  (the fixed IPv6 extension-header node tables *are* included).
+- Don't expect a TCP/UDP row on a continuation fragment — it appears only when `frag_offset == 0`.
+
 ## Tables produced
 
 | File | Contents |
