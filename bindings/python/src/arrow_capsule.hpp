@@ -77,6 +77,31 @@ inline nb::capsule make_stream_capsule(ArrowArrayStream* stream) {
     });
 }
 
+inline nb::capsule make_schema_capsule(ArrowSchema* schema) {
+    return nb::capsule(schema, "arrow_schema", [](void* p) noexcept {
+        auto* s = static_cast<ArrowSchema*>(p);
+        if (s->release) {
+            s->release(s);
+        }
+        std::free(s);
+    });
+}
+
+inline nb::capsule make_array_capsule(ArrowArray* array) {
+    return nb::capsule(array, "arrow_array", [](void* p) noexcept {
+        auto* a = static_cast<ArrowArray*>(p);
+        if (a->release) {
+            a->release(a);
+        }
+        std::free(a);
+    });
+}
+
+struct SingleBatchStreamState {
+    std::unique_ptr<ArrowSchema, void (*)(ArrowSchema*)> schema{nullptr, ArrowSchemaRelease};
+    std::unique_ptr<ArrowArray, void (*)(ArrowArray*)> array{nullptr, ArrowArrayRelease};
+};
+
 struct OwnedSchema {
     ArrowSchema schema{};
     OwnedSchema() { ArrowSchemaInit(&schema); }
@@ -187,19 +212,27 @@ public:
             return;
         }
 
-        auto [schema, array] = import_batch(obj);
-        single_schema_ = std::move(schema);
-        single_array_ = std::move(array);
-        single_pending_ = true;
+        if (nb::hasattr(obj, "__arrow_c_array__")) {
+            auto imported = import_batch(obj);
+            single_batch_state_ = std::make_shared<detail::SingleBatchStreamState>();
+            single_batch_state_->schema = std::move(imported.first);
+            single_batch_state_->array = std::move(imported.second);
+
+            auto* stream = static_cast<ArrowArrayStream*>(std::malloc(sizeof(ArrowArrayStream)));
+            std::memset(stream, 0, sizeof(ArrowArrayStream));
+            nanoarrow_check("ArrowBasicArrayStreamInit",
+                            ArrowBasicArrayStreamInit(stream, single_batch_state_->schema.get(), 1));
+            ArrowBasicArrayStreamSetArray(stream, 0, single_batch_state_->array.get());
+            single_batch_state_->schema.release();
+            single_batch_state_->array.release();
+            stream_.reset(stream);
+            return;
+        }
+
+        throw std::runtime_error("object does not export Arrow data via PyCapsule interface");
     }
 
     bool next(ArrowSchema* out_schema, ArrowArray* out_array) {
-        if (single_pending_) {
-            single_pending_ = false;
-            ArrowSchemaMove(single_schema_.get(), out_schema);
-            ArrowArrayMove(single_array_.get(), out_array);
-            return true;
-        }
         if (!stream_) {
             return false;
         }
@@ -223,11 +256,9 @@ public:
 
 private:
     nb::object keepalive_;
+    std::shared_ptr<detail::SingleBatchStreamState> single_batch_state_;
     std::unique_ptr<ArrowArrayStream, void (*)(ArrowArrayStream*)> stream_{nullptr,
                                                                             ArrowArrayStreamRelease};
-    std::unique_ptr<ArrowSchema, void (*)(ArrowSchema*)> single_schema_{nullptr, ArrowSchemaRelease};
-    std::unique_ptr<ArrowArray, void (*)(ArrowArray*)> single_array_{nullptr, ArrowArrayRelease};
-    bool single_pending_ = false;
     bool schema_loaded_ = false;
 };
 

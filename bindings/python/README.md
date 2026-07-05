@@ -57,6 +57,22 @@ import lance
 assert lance.dataset("out.lance").to_table().equals(table)
 ```
 
+### NumPy (zero-copy columns)
+
+```python
+import numpy as np
+from nanoarrow_io import numpy as naio_numpy, parquet
+
+cols = {
+    "id": np.arange(1_000_000, dtype=np.int64),
+    "value": np.arange(1_000_000, dtype=np.float64) * 0.01,
+}
+parquet.write_table(naio_numpy.record_batch(cols), "out.parquet")
+```
+
+Columns must be 1-D, C-contiguous, and use a supported numeric dtype (bool, int/uint/float
+1/2/4/8-byte widths). String/object columns still require pyarrow/polars export today.
+
 ## API
 
 | Module | Function | Description |
@@ -65,6 +81,7 @@ assert lance.dataset("out.lance").to_table().equals(table)
 | `nanoarrow_io.parquet` | `write_batch(batch, path, codec="zstd")` | Single row-group file |
 | `nanoarrow_io.nanolance` | `write_table(table, path, **opts)` | Write a Lance dataset |
 | `nanoarrow_io.nanolance` | `read_table(path)` | Arrow-exportable Lance reader handle |
+| `nanoarrow_io.numpy` | `record_batch(columns)` | Zero-copy NumPy column dict → Arrow export |
 
 ## Benchmarks
 

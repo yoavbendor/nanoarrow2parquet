@@ -83,4 +83,8 @@ nanobind_add_module(_nanolance STABLE_ABI NB_STATIC src/nanolance_bindings.cpp)
 target_include_directories(_nanolance PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(_nanolance PRIVATE nanolance::nanolance nanoarrow_static)
 
-install(TARGETS _n2p _nanolance LIBRARY DESTINATION nanoarrow_io)
+nanobind_add_module(_numpy STABLE_ABI NB_STATIC src/numpy_bindings.cpp)
+target_include_directories(_numpy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(_numpy PRIVATE nanoarrow_static)
+
+install(TARGETS _n2p _nanolance _numpy LIBRARY DESTINATION nanoarrow_io)

@@ -22,8 +22,9 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=7", "pyarrow>=16", "pandas>=2", "polars>=1", "psutil>=5.9", "pylance>=0.17"]
-bench = ["pyarrow>=16", "psutil>=5.9", "pylance>=0.17"]
+test = ["pytest>=7", "pyarrow>=16", "pandas>=2", "polars>=1", "psutil>=5.9", "pylance>=0.17", "numpy>=1.23"]
+bench = ["pyarrow>=16", "psutil>=5.9", "pylance>=0.17", "numpy>=1.23"]
+numpy = ["numpy>=1.23"]
 
 [project.urls]
 Homepage = "https://github.com/yoavbendor/nanoarrow2parquet"
