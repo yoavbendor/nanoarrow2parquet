@@ -57,6 +57,7 @@ FetchContent_Declare(
     GIT_REPOSITORY https://github.com/yoavbendor/nanolance.git
     GIT_TAG 08e1bd4ee8060f4a9aea473b1b80e8e3246a342b
     GIT_SHALLOW FALSE
+    PATCH_COMMAND git apply ${N2P_ROOT}/patches/nanolance-structural-dict.patch
 )
 FetchContent_MakeAvailable(nanolance)
 
