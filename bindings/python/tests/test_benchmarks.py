@@ -5,7 +5,7 @@ Nanolance vs pylance is highly dataset-dependent. Prior C++ benches (nanolance
 a larger gap on high-cardinality scattered strings. Threading is not the main
 factor: limiting pylance to one Rayon worker only modestly slows it (~20–30%),
 while nanolance string writes are dominated by the plain variable-width encode
-path (no dict-RLE unless values form long runs).
+path when dictionary encoding does not apply.
 """
 
 from __future__ import annotations
@@ -181,8 +181,8 @@ def test_lance_write_pcap_ref_with_zstd_near_pylance(tmp_path):
 
 
 @pytest.mark.bench
-def test_lance_scattered_strings_slower_than_pylance(tmp_path):
-    """Documents the known gap: cycling low-card strings skip dict-RLE (not threading)."""
+def test_lance_cycling_strings_near_pylance(tmp_path):
+    """Cycling low-card strings: structural dictionary should be near pylance parity."""
     lance = require_pylance()
     n = 200_000
     table = pa.table(
@@ -201,15 +201,19 @@ def test_lance_scattered_strings_slower_than_pylance(tmp_path):
             nl_path,
         ),
     )
+    nl_sz = _mb(nl_path)
 
     pl_path = tmp_path / "pylance.lance"
     pl_1t = _pylance_write_seconds(lance, table, pl_path, rayon_threads=1)
-    pl_def = _pylance_write_seconds(lance, table, pl_path, rayon_threads=None)
+    pl_sz = _mb(pl_path)
+
+    assert pa.table(nanolance.read_table(nl_path)).num_rows == n
 
     ratio_1t = nl_s / max(pl_1t, 1e-9)
+    size_ratio = nl_sz / max(pl_sz, 1e-9)
     print(
-        f"lance scattered-string write: nanolance={nl_s:.3f}s pylance(1t)={pl_1t:.3f}s "
-        f"pylance(default)={pl_def:.3f}s ratio={ratio_1t:.1f}x (informational)"
+        f"lance cycling-string write: nanolance={nl_s:.3f}s pylance(1t)={pl_1t:.3f}s "
+        f"ratio={ratio_1t:.2f}x; size nanolance={nl_sz:.2f}MB pylance={pl_sz:.2f}MB ratio={size_ratio:.2f}x"
     )
-    # Informational only — tracks the nanolance encoder gap, not a regression gate.
-    assert ratio_1t > 2.0
+    assert ratio_1t < 4.0
+    assert size_ratio < 2.5

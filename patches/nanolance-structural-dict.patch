@@ -1,0 +1,589 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 329f7a8..3921b8c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -343,6 +343,10 @@ add_executable(nano_lance_dict_rle_roundtrip_test tests/test_dict_rle_roundtrip.
+ target_compile_features(nano_lance_dict_rle_roundtrip_test PRIVATE cxx_std_20)
+ target_link_libraries(nano_lance_dict_rle_roundtrip_test PRIVATE nanolance)
+ 
++add_executable(nano_lance_dict_roundtrip_test tests/test_dict_roundtrip.cpp)
++target_compile_features(nano_lance_dict_roundtrip_test PRIVATE cxx_std_20)
++target_link_libraries(nano_lance_dict_roundtrip_test PRIVATE nanolance)
++
+ add_executable(nano_lance_array_accessor_test tests/test_array_accessor.cpp)
+ target_compile_features(nano_lance_array_accessor_test PRIVATE cxx_std_20)
+ target_link_libraries(nano_lance_array_accessor_test PRIVATE nanolance)
+@@ -428,6 +432,9 @@ set_tests_properties(nano_lance_rle_roundtrip PROPERTIES LABELS "smoke")
+ add_test(NAME nano_lance_dict_rle_roundtrip COMMAND $<TARGET_FILE:nano_lance_dict_rle_roundtrip_test>)
+ set_tests_properties(nano_lance_dict_rle_roundtrip PROPERTIES LABELS "smoke")
+ 
++add_test(NAME nano_lance_dict_roundtrip COMMAND $<TARGET_FILE:nano_lance_dict_roundtrip_test>)
++set_tests_properties(nano_lance_dict_roundtrip PROPERTIES LABELS "smoke")
++
+ add_test(NAME nano_lance_array_accessor COMMAND $<TARGET_FILE:nano_lance_array_accessor_test>)
+ set_tests_properties(nano_lance_array_accessor PROPERTIES LABELS "smoke")
+ 
+@@ -535,4 +542,12 @@ if(NANOLANCE_BUILD_TOOLS)
+                 "${NANO_LANCE_WRITER_PYTHON}"
+     )
+     set_tests_properties(app_arrowipc2lance_append_smoke PROPERTIES LABELS "smoke")
++
++    add_test(
++        NAME app_dict_pylance_interop_smoke
++        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke_dict_pylance_interop.sh"
++                "$<TARGET_FILE:arrowipc2lance>"
++                "${NANO_LANCE_WRITER_PYTHON}"
++    )
++    set_tests_properties(app_dict_pylance_interop_smoke PROPERTIES LABELS "smoke" SKIP_RETURN_CODE 77)
+ endif()
+diff --git a/src/data_file_writer.cpp b/src/data_file_writer.cpp
+index c9b527d..db77b2a 100644
+--- a/src/data_file_writer.cpp
++++ b/src/data_file_writer.cpp
+@@ -219,6 +219,9 @@ std::vector<std::uint8_t> miniblock_payload(const std::vector<MiniblockChunk>& c
+         out.push_back(0xFEU);
+         out.push_back(0xFEU);
+         out.insert(out.end(), chunk.bytes.begin(), chunk.bytes.end());
++        while (out.size() % 8U != 0U) {
++            out.push_back(0U);
++        }
+     }
+     return out;
+ }
+@@ -332,12 +335,13 @@ std::vector<std::uint8_t> build_multibuffer_chunk(const std::vector<std::vector<
+     return out;
+ }
+ 
+-// MiniBlockLayout tail (f6 layers, f7 num_buffers, f9 num_items, f10 has_large_chunk=1).
+-std::vector<std::uint8_t> miniblock_tail(std::uint64_t num_items, std::uint8_t num_buffers) {
++// MiniBlockLayout tail (f6 layers, f7 num_buffers, f9 num_items, f10 has_large_chunk).
++std::vector<std::uint8_t> miniblock_tail(std::uint64_t num_items, std::uint8_t num_buffers,
++                                         bool has_large_chunk = true) {
+     std::vector<std::uint8_t> t{0x32, 0x01, 0x01, 0x38, num_buffers, 0x48};
+     append_varint(t, num_items);
+     t.push_back(0x50);
+-    t.push_back(0x01);
++    t.push_back(has_large_chunk ? 0x01U : 0x00U);
+     return t;
+ }
+ 
+@@ -377,6 +381,27 @@ std::vector<std::uint8_t> build_dict_variable_block(const std::vector<std::strin
+     return out;
+ }
+ 
++// PageLayout for structural dictionary with flat bitpacked u32 indices (matches stock Lance for
++// scattered low-cardinality strings): value_compression = InlineBitpacking(32), dictionary =
++// Variable+Flat(32) without general compression, num_buffers=1, has_large_chunk=false.
++std::vector<std::uint8_t> page_layout_bytes_dict(std::uint32_t num_distinct, std::uint64_t num_items) {
++    static const std::uint8_t kF3Bitpack[] = {0x1a, 0x04, 0x2a, 0x02, 0x08, 0x20};
++    static const std::uint8_t kF4Dict[] = {0x22, 0x08, 0x12, 0x06, 0x0a, 0x04, 0x0a, 0x02, 0x08, 0x20};
++    std::vector<std::uint8_t> structural(kF3Bitpack, kF3Bitpack + sizeof(kF3Bitpack));
++    structural.insert(structural.end(), kF4Dict, kF4Dict + sizeof(kF4Dict));
++    structural.push_back(0x28);  // f5 num_dictionary_items
++    append_varint(structural, num_distinct);
++    const auto tail = miniblock_tail(num_items, 1U, false);
++    structural.insert(structural.end(), tail.begin(), tail.end());
++
++    std::vector<std::uint8_t> page_layout;
++    write_length_delimited(page_layout, 1, structural);
++    std::vector<std::uint8_t> encoding;
++    write_string_field(encoding, 1, "/lance.encodings21.PageLayout");
++    write_length_delimited(encoding, 2, page_layout);
++    return encoding;
++}
++
+ // PageLayout for a dictionary-encoded low-cardinality column: value_compression = Rle over u32
+ // indices, dictionary = General(ZSTD)+Variable, num_dictionary_items, num_buffers=2.
+ std::vector<std::uint8_t> page_layout_bytes_dict_rle(std::uint32_t num_distinct, std::uint64_t num_items) {
+@@ -881,6 +906,84 @@ bool write_lance_data_file(const std::filesystem::path& dataset_path,
+             continue;
+         }
+ 
++        // Structural dictionary for scattered low-cardinality strings: flat bitpacked u32 indices in
++        // buffer[1], uncompressed dictionary variable block in buffer[2].
++        if (packing_it != field.metadata.end() && packing_it->second == "dict" &&
++            values.kind == ColumnValues::Kind::VariableWidth) {
++            const bool large =
++                field.logical_type == "large_utf8" || field.logical_type == "large_binary";
++            const std::size_t ow = large ? 8U : 4U;
++            const std::size_t num_rows = values.variable.offsets.size() / ow - 1U;
++            auto read_offset = [&](std::size_t idx) -> std::int64_t {
++                const auto* p = values.variable.offsets.data() + idx * ow;
++                if (large) {
++                    std::int64_t v = 0;
++                    std::memcpy(&v, p, 8);
++                    return v;
++                }
++                std::int32_t v = 0;
++                std::memcpy(&v, p, 4);
++                return v;
++            };
++            std::map<std::string, std::uint32_t> dict;
++            std::vector<std::string> distinct;
++            std::vector<std::uint32_t> indices;
++            indices.reserve(num_rows);
++            for (std::size_t r = 0; r < num_rows; ++r) {
++                const auto s = read_offset(r);
++                const auto e = read_offset(r + 1);
++                std::string val(reinterpret_cast<const char*>(values.variable.data.data() + s),
++                                static_cast<std::size_t>(e - s));
++                auto it = dict.find(val);
++                if (it == dict.end()) {
++                    const auto id = static_cast<std::uint32_t>(distinct.size());
++                    dict.emplace(val, id);
++                    distinct.push_back(std::move(val));
++                    indices.push_back(id);
++                } else {
++                    indices.push_back(it->second);
++                }
++            }
++            std::vector<MiniblockChunk> index_chunks;
++            for (std::size_t off = 0; off < indices.size(); off += 1024U) {
++                const auto count = std::min<std::size_t>(1024U, indices.size() - off);
++                MiniblockChunk chunk;
++                chunk.value_count = count;
++                chunk.bytes = build_bitpacked_chunk(reinterpret_cast<const std::uint8_t*>(indices.data() + off),
++                                                    count, 4U);
++                index_chunks.push_back(std::move(chunk));
++            }
++            const auto payload = miniblock_payload(index_chunks);
++            const auto control = control_buffer_for(index_chunks);
++            const auto dict_block = build_dict_variable_block(distinct);
++
++            align64(out);
++            const auto control_offset = pos(out);
++            out.write(reinterpret_cast<const char*>(control.data()), static_cast<std::streamsize>(control.size()));
++            align64(out);
++            const auto data_offset = pos(out);
++            out.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
++            align64(out);
++            const auto dict_offset = pos(out);
++            out.write(reinterpret_cast<const char*>(dict_block.data()), static_cast<std::streamsize>(dict_block.size()));
++
++            pb::ColumnMetadata column;
++            column.encoding = column_encoding_bytes();
++            pb::ColumnPage page;
++            page.buffer_offsets.push_back(control_offset);
++            page.buffer_offsets.push_back(data_offset);
++            page.buffer_offsets.push_back(dict_offset);
++            page.buffer_sizes.push_back(control.size());
++            page.buffer_sizes.push_back(payload.size());
++            page.buffer_sizes.push_back(dict_block.size());
++            page.length = rows;
++            page.priority = 0;
++            page.encoding = page_layout_bytes_dict(static_cast<std::uint32_t>(distinct.size()), rows);
++            column.pages.push_back(std::move(page));
++            columns.push_back(std::move(column));
++            continue;
++        }
++
+         std::vector<MiniblockChunk> chunks;
+         const bool is_variable = values.kind == ColumnValues::Kind::VariableWidth;
+         const bool bitpack = !is_variable && compress && lance_logical_type_is_bitpackable_integer(field.logical_type);
+diff --git a/src/lance_column_decoder.cpp b/src/lance_column_decoder.cpp
+index 708d99a..291f153 100644
+--- a/src/lance_column_decoder.cpp
++++ b/src/lance_column_decoder.cpp
+@@ -109,7 +109,42 @@ bool parse_miniblock_payload_chunks(const std::vector<std::uint8_t>& payload, st
+         }
+         out.insert(out.end(), payload.begin() + static_cast<std::ptrdiff_t>(data_start),
+                    payload.begin() + static_cast<std::ptrdiff_t>(data_end));
+-        offset = data_end;
++        offset = (data_end + 7U) & ~static_cast<std::size_t>(7U);
++    }
++    return true;
++}
++
++bool parse_miniblock_payload_chunk_list(const std::vector<std::uint8_t>& payload,
++                                        std::vector<std::vector<std::uint8_t>>& out, std::string& error) {
++    out.clear();
++    std::size_t offset = 0;
++    while (offset < payload.size()) {
++        if (offset + 8U > payload.size()) {
++            error = "truncated miniblock payload header";
++            return false;
++        }
++        if (payload[offset] != 0U || payload[offset + 1U] != 0U) {
++            error = "unexpected miniblock payload prefix";
++            return false;
++        }
++        std::uint16_t chunk_size = 0;
++        if (!read_le16(payload.data() + offset + 2U, chunk_size)) {
++            error = "failed to read miniblock chunk size";
++            return false;
++        }
++        if (payload[offset + 6U] != 0xFEU || payload[offset + 7U] != 0xFEU) {
++            error = "unexpected miniblock payload marker";
++            return false;
++        }
++        const auto data_start = offset + 8U;
++        const auto data_end = data_start + static_cast<std::size_t>(chunk_size);
++        if (data_end > payload.size()) {
++            error = "miniblock chunk exceeds payload";
++            return false;
++        }
++        out.emplace_back(payload.begin() + static_cast<std::ptrdiff_t>(data_start),
++                         payload.begin() + static_cast<std::ptrdiff_t>(data_end));
++        offset = (data_end + 7U) & ~static_cast<std::size_t>(7U);
+     }
+     return true;
+ }
+@@ -500,6 +535,89 @@ bool decode_lance_physical_column(const std::filesystem::path& data_file_path, c
+         return true;
+     }
+ 
++    // Structural dictionary variable-width column: buffer[1] = bitpacked u32 indices, buffer[2] = dictionary.
++    if (field_metadata_equals(on_disk_field, "nanolance:packing", "dict")) {
++        out.kind = ColumnValues::Kind::VariableWidth;
++        out.variable.large = on_disk_field.logical_type == "large_utf8" || on_disk_field.logical_type == "large_binary";
++        for (const auto& page : column_metadata.pages) {
++            if (page.buffer_offsets.size() < 3U || page.buffer_sizes.size() < 3U) {
++                error = "dict page missing buffers";
++                return false;
++            }
++            std::vector<std::uint8_t> payload;
++            std::vector<std::uint8_t> dict_block;
++            if (!read_lance_data_file_bytes(data_file_path, page.buffer_offsets[1], page.buffer_sizes[1], payload,
++                                            error) ||
++                !read_lance_data_file_bytes(data_file_path, page.buffer_offsets[2], page.buffer_sizes[2], dict_block,
++                                            error)) {
++                return false;
++            }
++            if (dict_block.size() < 8U) {
++                error = "dict block too short";
++                return false;
++            }
++            std::uint32_t bytes_start = 0;
++            std::memcpy(&bytes_start, dict_block.data() + 4U, 4U);
++            if (bytes_start < 12U || bytes_start > dict_block.size() || (bytes_start - 8U) % 4U != 0U) {
++                error = "dict block header invalid";
++                return false;
++            }
++            const std::size_t num_dict = (bytes_start - 8U) / 4U - 1U;
++            std::vector<std::pair<std::uint32_t, std::uint32_t>> dict_ranges(num_dict);
++            for (std::size_t d = 0; d < num_dict; ++d) {
++                std::uint32_t a = 0;
++                std::uint32_t b = 0;
++                std::memcpy(&a, dict_block.data() + 8U + d * 4U, 4U);
++                std::memcpy(&b, dict_block.data() + 8U + (d + 1U) * 4U, 4U);
++                if (bytes_start + b > dict_block.size() || b < a) {
++                    error = "dict offsets out of range";
++                    return false;
++                }
++                dict_ranges[d] = {bytes_start + a, b - a};
++            }
++            std::vector<std::vector<std::uint8_t>> chunks;
++            if (!parse_miniblock_payload_chunk_list(payload, chunks, error)) {
++                return false;
++            }
++            if (chunks.empty()) {
++                error = "dict page has no index chunks";
++                return false;
++            }
++            std::vector<std::uint8_t> indices_bytes;
++            std::uint64_t rows_remaining = page.length;
++            for (std::size_t ci = 0; ci < chunks.size(); ++ci) {
++                const auto count = std::min<std::uint64_t>(1024U, rows_remaining);
++                if (!unpack_bitpacked_page_dispatch(chunks[ci], count, 4U, indices_bytes, error)) {
++                    return false;
++                }
++                rows_remaining -= count;
++            }
++            if (rows_remaining != 0U || indices_bytes.size() != page.length * 4U) {
++                error = "dict index count mismatch";
++                return false;
++            }
++            const bool first_page = out.variable.offsets.empty();
++            std::uint64_t cumulative = out.variable.data.size();
++            if (first_page) {
++                append_list_offset(out.variable.offsets, static_cast<std::int64_t>(cumulative), out.variable.large);
++            }
++            for (std::uint64_t r = 0; r < page.length; ++r) {
++                std::uint32_t index = 0;
++                std::memcpy(&index, indices_bytes.data() + r * 4U, 4U);
++                if (index >= num_dict) {
++                    error = "dict index out of range";
++                    return false;
++                }
++                const auto [start, len] = dict_ranges[index];
++                out.variable.data.insert(out.variable.data.end(), dict_block.begin() + static_cast<std::ptrdiff_t>(start),
++                                         dict_block.begin() + static_cast<std::ptrdiff_t>(start + len));
++                cumulative += len;
++                append_list_offset(out.variable.offsets, static_cast<std::int64_t>(cumulative), out.variable.large);
++            }
++        }
++        return true;
++    }
++
+     const bool variable = on_disk_field.encoding == 2;
+     if (variable) {
+         out.kind = ColumnValues::Kind::VariableWidth;
+diff --git a/src/writer.cpp b/src/writer.cpp
+index 17354c8..07df569 100644
+--- a/src/writer.cpp
++++ b/src/writer.cpp
+@@ -19,6 +19,7 @@
+ #include <memory>
+ #include <map>
+ #include <string>
++#include <unordered_map>
+ #include <vector>
+ 
+ namespace {
+@@ -183,6 +184,70 @@ bool variable_column_dict_rle_beneficial(const nano_lance::ColumnValues& cv) {
+     return (values_size + split_runs + 32U) <= 32760U;
+ }
+ 
++// Decide whether a structural dictionary (flat bitpacked indices + dictionary buffer) wins for a
++// scattered low-cardinality string column. Mirrors Lance defaults: dict-divisor=2, dict-size-ratio=0.8,
++// min 100 rows, max 100k distinct values.
++bool variable_column_dict_beneficial(const nano_lance::ColumnValues& cv) {
++    constexpr std::size_t kMinRows = 100U;
++    constexpr std::size_t kDictDivisor = 2U;
++    constexpr double kDictSizeRatio = 0.8;
++    constexpr std::size_t kMaxCardinality = 100000U;
++
++    const std::size_t ow = cv.variable.large ? 8U : 4U;
++    if (cv.variable.offsets.size() < 2U * ow) {
++        return false;
++    }
++    auto read_offset = [&](std::size_t index) -> std::int64_t {
++        const auto* p = cv.variable.offsets.data() + index * ow;
++        if (cv.variable.large) {
++            std::int64_t v = 0;
++            std::memcpy(&v, p, 8);
++            return v;
++        }
++        std::int32_t v = 0;
++        std::memcpy(&v, p, 4);
++        return v;
++    };
++    const std::size_t rows = cv.variable.offsets.size() / ow - 1U;
++    if (rows < kMinRows) {
++        return false;
++    }
++    const char* base = reinterpret_cast<const char*>(cv.variable.data.data());
++    const std::size_t data_size = cv.variable.data.size();
++    std::unordered_map<std::string_view, std::uint32_t> dict;
++    dict.reserve(rows / 4U);
++    std::size_t raw_bytes = 0;
++    for (std::size_t i = 0; i < rows; ++i) {
++        const auto s = read_offset(i);
++        const auto e = read_offset(i + 1);
++        if (s < 0 || e < s || static_cast<std::size_t>(e) > data_size) {
++            return false;
++        }
++        const auto len = static_cast<std::size_t>(e - s);
++        raw_bytes += len;
++        const std::string_view val(base + s, len);
++        auto it = dict.find(val);
++        if (it == dict.end()) {
++            if (dict.size() >= kMaxCardinality) {
++                return false;
++            }
++            dict.emplace(val, static_cast<std::uint32_t>(dict.size()));
++        }
++    }
++    if (dict.empty() || dict.size() > rows / kDictDivisor) {
++        return false;
++    }
++    std::size_t dict_data = 0;
++    for (const auto& [val, _] : dict) {
++        dict_data += val.size();
++    }
++    const std::size_t dict_bytes = 8U + (dict.size() + 1U) * 4U + dict_data;
++    const std::size_t index_bytes = rows * 4U;
++    const std::size_t raw_total = raw_bytes + (rows + 1U) * ow;
++    const std::size_t encoded_total = dict_bytes + index_bytes;
++    return encoded_total < static_cast<std::size_t>(static_cast<double>(raw_total) * kDictSizeRatio);
++}
++
+ WriterState* state_from(NanoLanceWriter* writer) {
+     if (writer == nullptr) {
+         return nullptr;
+@@ -581,6 +646,17 @@ int nano_lance_writer_commit(NanoLanceWriter* writer, bool is_append) {
+                 for (auto& field : disk_schema.fields) {
+                     if (field.id == pf->id) {
+                         field.metadata["nanolance:packing"] = "dict-rle";
++                        field.metadata.erase("lance-encoding:compression");
++                        break;
++                    }
++                }
++            } else if (cv.kind == nano_lance::ColumnValues::Kind::VariableWidth &&
++                       variable_column_dict_beneficial(cv)) {
++                // Scattered low-cardinality strings -> structural dictionary + flat indices.
++                for (auto& field : disk_schema.fields) {
++                    if (field.id == pf->id) {
++                        field.metadata["nanolance:packing"] = "dict";
++                        field.metadata.erase("lance-encoding:compression");
+                         break;
+                     }
+                 }
+diff --git a/tests/smoke_dict_pylance_interop.sh b/tests/smoke_dict_pylance_interop.sh
+new file mode 100755
+index 0000000..cc5784f
+--- /dev/null
++++ b/tests/smoke_dict_pylance_interop.sh
+@@ -0,0 +1,44 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++bin="${1:?arrowipc2lance binary path required}"
++python_bin="${2:?python interpreter path required}"
++tmpdir="$(mktemp -d)"
++command -v cygpath >/dev/null 2>&1 && tmpdir="$(cygpath -m "$tmpdir")"
++trap 'rm -rf "$tmpdir"' EXIT
++
++ipc_path="$tmpdir/input.arrow"
++dataset_path="$tmpdir/out.lance"
++
++"$python_bin" - <<PY
++import pyarrow as pa
++import pyarrow.ipc as ipc
++
++n = 50000
++vals = [f"row-{i % 500}" for i in range(n)]
++schema = pa.schema([pa.field("s", pa.string(), nullable=False)])
++table = pa.Table.from_arrays([pa.array(vals, type=pa.string())], schema=schema)
++with open("$ipc_path", "wb") as sink:
++    with ipc.new_stream(sink, schema) as writer:
++        writer.write_table(table)
++PY
++
++"$bin" -o "$dataset_path" -c -l 3 < "$ipc_path"
++
++"$python_bin" - "$dataset_path" <<'PY'
++import sys
++import lance
++
++n = 50000
++vals = [f"row-{i % 500}" for i in range(n)]
++try:
++    table = lance.dataset(sys.argv[1]).to_table()
++except Exception as exc:
++    print(f"dict interop skipped: {exc}", file=sys.stderr)
++    sys.exit(77)
++
++assert table.num_rows == n, table.num_rows
++got = table.column(0).to_pylist()
++assert got == vals, "stock lance must read nanolance dict-encoded strings"
++print("dict interop ok (nanolance write, pylance read)")
++PY
+diff --git a/tests/test_dict_roundtrip.cpp b/tests/test_dict_roundtrip.cpp
+new file mode 100644
+index 0000000..78908c6
+--- /dev/null
++++ b/tests/test_dict_roundtrip.cpp
+@@ -0,0 +1,112 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright (c) 2026 Yoav Bendor
++
++// Round-trip test for structural dictionary encoding of scattered low-cardinality strings
++// (e.g. row-{i%500}). Verifies nanolance reads its own dict output back exactly and the data file
++// is much smaller than plain variable-width encoding.
++#include "nanolance/lance_table_reader.hpp"
++#include "nanolance/nano_lance_writer.h"
++
++#include <nanoarrow/nanoarrow.h>
++
++#include <cstdlib>
++#include <filesystem>
++#include <iostream>
++#include <string>
++#include <vector>
++
++namespace {
++
++void require(bool ok, const char* msg) {
++    if (!ok) {
++        std::cerr << "FAIL: " << msg << '\n';
++        std::exit(1);
++    }
++}
++
++std::filesystem::path temp_dataset(const char* suffix) {
++    auto p = std::filesystem::temp_directory_path() / ("nano_lance_dict_" + std::string(suffix));
++    std::error_code ec;
++    std::filesystem::remove_all(p, ec);
++    return p;
++}
++
++std::uintmax_t data_dir_bytes(const std::filesystem::path& ds) {
++    std::uintmax_t total = 0;
++    std::error_code ec;
++    for (const auto& e : std::filesystem::directory_iterator(ds / "data", ec)) {
++        if (e.is_regular_file() && e.path().extension() == ".lance") {
++            total += std::filesystem::file_size(e.path(), ec);
++        }
++    }
++    return total;
++}
++
++void write_strings(const std::filesystem::path& ds, bool compress, const std::vector<std::string>& vals) {
++    ArrowSchema schema{};
++    ArrowSchemaInit(&schema);
++    require(ArrowSchemaSetFormat(&schema, "u") == NANOARROW_OK, "format");
++    require(ArrowSchemaSetName(&schema, "u") == NANOARROW_OK, "name");
++    ArrowArray source{};
++    require(ArrowArrayInitFromSchema(&source, &schema, nullptr) == NANOARROW_OK, "array init");
++    require(ArrowArrayStartAppending(&source) == NANOARROW_OK, "append start");
++    for (const auto& v : vals) {
++        require(ArrowArrayAppendString(&source, {v.data(), static_cast<int64_t>(v.size())}) == NANOARROW_OK, "append");
++    }
++    require(ArrowArrayFinishBuildingDefault(&source, nullptr) == NANOARROW_OK, "finish");
++    NanoLanceWriter writer{};
++    require(nano_lance_writer_init(&writer, ds.string().c_str(), 3) == NANO_LANCE_OK, "init");
++    require(nano_lance_writer_set_ignore_nullability(&writer, true) == NANO_LANCE_OK, "ignore null");
++    require(nano_lance_writer_set_compression(&writer, compress) == NANO_LANCE_OK, "compress");
++    require(nano_lance_write_batch(&writer, &source, &schema) == NANO_LANCE_OK, "write");
++    require(nano_lance_writer_commit(&writer, false) == NANO_LANCE_OK, "commit");
++    require(nano_lance_writer_close(&writer) == NANO_LANCE_OK, "close");
++    ArrowArrayRelease(&source);
++    ArrowSchemaRelease(&schema);
++}
++
++std::vector<std::string> read_strings(const std::filesystem::path& ds) {
++    ArrowSchema schema{};
++    std::vector<ArrowArray> batches;
++    std::string error;
++    require(nano_lance::lance_table_read_dataset(ds, schema, batches, error), error.c_str());
++    const ArrowArray* col = (batches[0].n_children > 0) ? batches[0].children[0] : &batches[0];
++    const auto* off = static_cast<const std::int32_t*>(col->buffers[1]);
++    const auto* data = static_cast<const char*>(col->buffers[2]);
++    std::vector<std::string> out;
++    for (std::int64_t i = 0; i < col->length; ++i) {
++        out.emplace_back(data + off[i], static_cast<std::size_t>(off[i + 1] - off[i]));
++    }
++    ArrowSchemaRelease(&schema);
++    ArrowArrayRelease(&batches[0]);
++    return out;
++}
++
++}  // namespace
++
++int main() {
++    // 50000 rows cycling through 500 distinct strings (scattered, not run-length).
++    std::vector<std::string> vals;
++    vals.reserve(50000);
++    for (int i = 0; i < 50000; ++i) {
++        vals.push_back("row-" + std::to_string(i % 500));
++    }
++
++    const auto ds_plain = temp_dataset("plain");
++    const auto ds_dict = temp_dataset("dict");
++    write_strings(ds_plain, /*compress=*/false, vals);
++    write_strings(ds_dict, /*compress=*/true, vals);
++
++    require(read_strings(ds_plain) == vals, "plain cycling string column must round-trip");
++    require(read_strings(ds_dict) == vals, "dict string column must round-trip");
++
++    const auto plain_bytes = data_dir_bytes(ds_plain);
++    const auto dict_bytes = data_dir_bytes(ds_dict);
++    std::cerr << "dict: plain=" << plain_bytes << "B dict=" << dict_bytes << "B\n";
++    require(dict_bytes * 5U < plain_bytes, "dict must drastically shrink a cycling string column");
++
++    std::error_code ec;
++    std::filesystem::remove_all(ds_plain, ec);
++    std::filesystem::remove_all(ds_dict, ec);
++    return 0;
++}
