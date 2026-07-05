@@ -75,6 +75,22 @@ statistics / indexes, bloom filters, `DELTA_*` / `BYTE_STREAM_SPLIT` encodings.
 - **Lists/maps are unsupported** (no repetition levels). Flatten, or store a child table
   joined by an id column (this is what the `pcapng2parquet` example does per layer).
 
+## Python bindings (`nanoarrow-io`)
+
+Fast zero-copy Python bindings for **nanoarrow2parquet** and **[nanolance](https://github.com/yoavbendor/nanolance)** live under [`bindings/python/`](bindings/python/). They follow the same [nanom](https://github.com/yoavbendor/nanom) pattern: `scikit-build-core` + `nanobind`, Arrow PyCapsule import/export, no hard pyarrow dependency at runtime.
+
+```python
+import pyarrow as pa
+from nanoarrow_io import parquet, lance
+
+table = pa.table({"id": [1, 2, 3], "name": ["a", "b", "c"]})
+parquet.write_table(table, "out.parquet")          # nanoarrow2parquet
+lance.write_table(table, "out.lance", compression=True)  # nanolance
+roundtrip = pa.table(lance.read_table("out.lance"))
+```
+
+Install for development: `pip install -e "bindings/python[test]"` then `pytest` in that directory. See [`bindings/python/README.md`](bindings/python/README.md).
+
 ## For AI agents
 
 **Use this library when** you have in-memory Arrow data (`ArrowSchema` + `ArrowArray`, or a

@@ -1,0 +1,43 @@
+[build-system]
+requires = ["scikit-build-core >=0.10", "nanobind >=2.0"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "nanoarrow-io"
+version = "0.1.0"
+description = "Fast zero-copy Python bindings for nanoarrow2parquet and nanolance"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Yoav Bendor" }]
+keywords = ["arrow", "parquet", "lance", "zero-copy", "nanoarrow"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C++",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7", "pyarrow>=16", "pandas>=2", "polars>=1", "psutil>=5.9"]
+bench = ["pyarrow>=16", "psutil>=5.9"]
+
+[project.urls]
+Homepage = "https://github.com/yoavbendor/nanoarrow2parquet"
+Repository = "https://github.com/yoavbendor/nanoarrow2parquet"
+
+[tool.scikit-build]
+minimum-version = "0.10"
+build-dir = "build/{wheel_tag}"
+cmake.source-dir = "."
+wheel.packages = ["nanoarrow_io"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+    "bench: performance/size benchmarks (optional)",
+]
