@@ -3,6 +3,9 @@
 /build-*/
 # FetchContent dependency sources/caches
 /.deps/
+bindings/python/build/
+**/__pycache__/
+*.pyc
 # Editor / tooling
 compile_commands.json
 *.o
