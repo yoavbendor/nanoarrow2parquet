@@ -66,13 +66,35 @@ assert lance.dataset("out.lance").to_table().equals(table)
 | `nanoarrow_io.nanolance` | `write_table(table, path, **opts)` | Write a Lance dataset |
 | `nanoarrow_io.nanolance` | `read_table(path)` | Arrow-exportable Lance reader handle |
 
+## Benchmarks
+
+```bash
+pytest tests/test_benchmarks.py -m bench
+```
+
+Nanolance vs pylance depends strongly on column shape (see nanolance `tools/bench.py` / `bench/linux-ci-results.md`):
+
+| profile | nanolance vs pylance (write) | notes |
+|---------|------------------------------|-------|
+| integer-heavy (`wide_int`) | ~1.3× | near parity |
+| repetitive string runs + zstd (`pcap_ref`) | ~0.8–1× | dict-RLE + zstd |
+| scattered low-card strings (`row-{i%500}`) | ~20–40× | plain variable-width path |
+
+**Threading:** pylance (Rust/Rayon) uses modest parallelism — limiting `RAYON_NUM_THREADS=1` typically costs only ~20–30%, not an order of magnitude. Nanolance bindings are single-threaded today (~100% of one core on CPU-bound writes). The scattered-string gap is encoder selection, not core count; multi-threaded zstd would not fix the plain miniblock string path.
+
+To compare fairly against pylance in your own scripts, pin Rayon when needed:
+
+```bash
+RAYON_NUM_THREADS=1 pytest tests/test_benchmarks.py -m bench
+```
+
 ## Tests
 
 - **Parity**: compares output against pyarrow / pandas / polars readers
 - **pylance interop**: files written by `nanolance` read back via `lance.dataset()`
 - **Full cycle**: Python → native writer → standard reader → Python
 - **Memory safety**: repeated write/read under RSS caps
-- **Benchmarks**: `pytest tests/test_benchmarks.py -k bench` (optional)
+- **Benchmarks**: `pytest tests/test_benchmarks.py -m bench` (optional; see Benchmarks above)
 
 ## Build layout
 
