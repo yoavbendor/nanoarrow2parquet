@@ -7,7 +7,7 @@ import gc
 import pyarrow as pa
 import pytest
 
-from nanoarrow_io import lance, parquet
+from nanoarrow_io import nanolance, parquet
 
 psutil = pytest.importorskip("psutil")
 PROC = psutil.Process()
@@ -30,8 +30,8 @@ def test_lance_repeated_roundtrip_bounded(sample_table, tmp_path):
     baseline = _rss_mb()
     for i in range(20):
         ds = tmp_path / f"mem_{i}.lance"
-        lance.write_table(sample_table, ds, compression=True)
-        _ = pa.table(lance.read_table(ds))
+        nanolance.write_table(sample_table, ds, compression=True)
+        _ = pa.table(nanolance.read_table(ds))
     gc.collect()
     growth = _rss_mb() - baseline
     assert growth < 250, f"RSS grew by {growth:.1f} MB after 20 lance cycles"

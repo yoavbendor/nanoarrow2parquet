@@ -2,7 +2,20 @@
 
 Fast, dependency-light Python bindings for [nanoarrow2parquet](https://github.com/yoavbendor/nanoarrow2parquet) and [nanolance](https://github.com/yoavbendor/nanolance).
 
-Data moves through the [Arrow PyCapsule interface](https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html) — no buffer copies on the Python ↔ native boundary. Output files are validated against the standard Python readers (pyarrow, pandas, polars, and the `lance` package).
+Data moves through the [Arrow PyCapsule interface](https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html) — no buffer copies on the Python ↔ native boundary. Output files are validated against pyarrow, pandas, polars, and the official Lance format SDK.
+
+## Naming: we do not shadow `import lance`
+
+The official Lance columnar format SDK is published on PyPI as **`pylance`** but imported as **`import lance`** ([lance-format/lance](https://github.com/lance-format/lance)). That is unrelated to Microsoft's **Pylance** VS Code language server.
+
+This package deliberately exposes its fast C++ bindings as **`nanoarrow_io.nanolance`**, not `nanoarrow_io.lance`, so you can use both side by side:
+
+```python
+import lance                              # official SDK (pip install pylance)
+from nanoarrow_io import nanolance        # fast C++ nanolance bindings
+```
+
+There is also an unrelated PyPI package named `lance` (JSON code generator) — do **not** `pip install lance` for Lance datasets; use **`pip install pylance`**.
 
 ## Install (development)
 
@@ -12,11 +25,17 @@ python -m pip install -e ".[test]"
 pytest
 ```
 
+Optional interoperability tests also need the official SDK:
+
+```bash
+pip install pylance
+```
+
 ## Quick start
 
 ```python
 import pyarrow as pa
-from nanoarrow_io import parquet, lance
+from nanoarrow_io import parquet, nanolance
 
 table = pa.table({
     "id": [1, 2, 3],
@@ -28,10 +47,14 @@ table = pa.table({
 parquet.write_table(table, "out.parquet")
 assert pa.parquet.read_table("out.parquet").equals(table)
 
-# Lance (nanolance)
-lance.write_table(table, "out.lance")
-roundtrip = pa.table(lance.read_table("out.lance"))
+# Lance (nanolance C++ bindings)
+nanolance.write_table(table, "out.lance")
+roundtrip = pa.table(nanolance.read_table("out.lance"))
 assert roundtrip.equals(table)
+
+# Official pylance reader (pip install pylance)
+import lance
+assert lance.dataset("out.lance").to_table().equals(table)
 ```
 
 ## API
@@ -40,12 +63,13 @@ assert roundtrip.equals(table)
 |--------|----------|-------------|
 | `nanoarrow_io.parquet` | `write_table(table, path, codec="zstd")` | Stream one or more record batches to Parquet |
 | `nanoarrow_io.parquet` | `write_batch(batch, path, codec="zstd")` | Single row-group file |
-| `nanoarrow_io.lance` | `write_table(table, path, **opts)` | Write a Lance dataset |
-| `nanoarrow_io.lance` | `read_table(path)` | Arrow-exportable Lance reader handle |
+| `nanoarrow_io.nanolance` | `write_table(table, path, **opts)` | Write a Lance dataset |
+| `nanoarrow_io.nanolance` | `read_table(path)` | Arrow-exportable Lance reader handle |
 
 ## Tests
 
 - **Parity**: compares output against pyarrow / pandas / polars readers
+- **pylance interop**: files written by `nanolance` read back via `lance.dataset()`
 - **Full cycle**: Python → native writer → standard reader → Python
 - **Memory safety**: repeated write/read under RSS caps
 - **Benchmarks**: `pytest tests/test_benchmarks.py -k bench` (optional)

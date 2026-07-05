@@ -1,4 +1,9 @@
-"""Lance reader/writer bindings backed by nanolance."""
+"""Lance reader/writer bindings backed by nanolance.
+
+Use this module for the fast C++ nanolance writer/reader. For the official
+Lance format SDK (Rust), install ``pylance`` and ``import lance`` — that is a
+separate, complementary package and is not shadowed by this submodule name.
+"""
 
 from __future__ import annotations
 

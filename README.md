@@ -81,13 +81,15 @@ Fast zero-copy Python bindings for **nanoarrow2parquet** and **[nanolance](https
 
 ```python
 import pyarrow as pa
-from nanoarrow_io import parquet, lance
+from nanoarrow_io import parquet, nanolance
 
 table = pa.table({"id": [1, 2, 3], "name": ["a", "b", "c"]})
 parquet.write_table(table, "out.parquet")          # nanoarrow2parquet
-lance.write_table(table, "out.lance", compression=True)  # nanolance
-roundtrip = pa.table(lance.read_table("out.lance"))
+nanolance.write_table(table, "out.lance", compression=True)  # nanolance
+roundtrip = pa.table(nanolance.read_table("out.lance"))
 ```
+
+The Lance submodule is named **`nanolance`** (not `lance`) so it does not shadow the official SDK (`pip install pylance` → `import lance`). See [`bindings/python/README.md`](bindings/python/README.md).
 
 Install for development: `pip install -e "bindings/python[test]"` then `pytest` in that directory. See [`bindings/python/README.md`](bindings/python/README.md).
 

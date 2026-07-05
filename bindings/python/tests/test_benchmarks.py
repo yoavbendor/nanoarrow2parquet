@@ -9,7 +9,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from nanoarrow_io import lance, parquet
+from nanoarrow_io import nanolance, parquet
 
 
 def _mb(path: os.PathLike) -> float:
@@ -65,7 +65,7 @@ def test_lance_write_speed(tmp_path):
 
     nl_path = tmp_path / "nanolance.lance"
     t0 = time.perf_counter()
-    lance.write_table(table, nl_path, compression=True)
+    nanolance.write_table(table, nl_path, compression=True)
     nl_s = time.perf_counter() - t0
 
     pq_path = tmp_path / "parquet_ref.parquet"
@@ -73,7 +73,7 @@ def test_lance_write_speed(tmp_path):
     pq.write_table(table, pq_path, compression="zstd")
     pq_s = time.perf_counter() - t0
 
-    assert pa.table(lance.read_table(nl_path)).num_rows == n
+    assert pa.table(nanolance.read_table(nl_path)).num_rows == n
 
     ratio = nl_s / max(pq_s, 1e-9)
     print(f"lance write: nanolance={nl_s:.3f}s parquet-ref={pq_s:.3f}s ratio={ratio:.2f}x")

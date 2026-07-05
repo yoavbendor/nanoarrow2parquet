@@ -30,7 +30,12 @@ def test_streaming_row_groups(sample_table, tmp_path):
     batch_a = pa.table({k: v[:2] for k, v in d.items()}, schema=sample_table.schema)
     batch_b = pa.table({k: v[2:4] for k, v in d.items()}, schema=sample_table.schema)
     batch_c = pa.table({k: v[4:] for k, v in d.items()}, schema=sample_table.schema)
-    reader = pa.RecordBatchReader.from_tables([batch_a, batch_b, batch_c])
+    batches = [
+        batch_a.to_batches()[0],
+        batch_b.to_batches()[0],
+        batch_c.to_batches()[0],
+    ]
+    reader = pa.RecordBatchReader.from_batches(sample_table.schema, batches)
     parquet.write_table(reader, path)
     md = pq.ParquetFile(path).metadata
     assert md.num_row_groups == 3
