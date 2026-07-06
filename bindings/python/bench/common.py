@@ -18,6 +18,7 @@ from nanoarrow_io import parquet as n2p_parquet
 Profile = Literal["mixed", "numeric", "string_dict"]
 Codec = Literal["zstd", "uncompressed"]
 Lib = Literal["n2p", "pyarrow", "polars"]
+StreamLib = Literal["n2p_stream", "n2p_table", "pyarrow_stream"]
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,61 @@ class BenchRow:
 
     def to_json(self) -> dict:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class StreamBenchRow:
+    lib: StreamLib
+    profile: Profile
+    rows: int
+    chunk_rows: int
+    codec: Codec
+    write_s: float
+    file_bytes: int
+    mrows_per_s: float
+
+    def to_json(self) -> dict:
+        return asdict(self)
+
+
+def make_batch(profile: Profile, start: int, n: int) -> pa.RecordBatch:
+    if profile == "mixed":
+        return pa.record_batch(
+            {
+                "id": pa.array(range(start, start + n), type=pa.int64()),
+                "tag": pa.array([f"row-{(start + i) % 1000}" for i in range(n)], type=pa.string()),
+                "value": pa.array([float(start + i) * 0.01 for i in range(n)], type=pa.float64()),
+            }
+        )
+    if profile == "numeric":
+        return pa.record_batch(
+            {
+                "id": pa.array(range(start, start + n), type=pa.int64()),
+                "value": pa.array([float(start + i) * 0.01 for i in range(n)], type=pa.float64()),
+                "category": pa.array([(start + i) % 256 for i in range(n)], type=pa.int32()),
+            }
+        )
+    if profile == "string_dict":
+        min_distinct = max(1, (start + n) // 5000)
+        return pa.record_batch(
+            {
+                "uri": pa.array(
+                    [
+                        f"s3://bucket/cap_{((start + i) * min_distinct // max(start + n, 1)):02d}.pcapng"
+                        for i in range(n)
+                    ],
+                    pa.string(),
+                ),
+                "position": pa.array([(start + i) * 1500 for i in range(n)], pa.uint64()),
+                "size": pa.array([1500] * n, pa.uint64()),
+            }
+        )
+    raise ValueError(f"unknown profile: {profile}")
+
+
+def iter_batches(profile: Profile, total_rows: int, chunk_rows: int):
+    for start in range(0, total_rows, chunk_rows):
+        yield make_batch(profile, start, min(chunk_rows, total_rows - start))
 
 
 def make_table(profile: Profile, rows: int) -> pa.Table:
@@ -94,6 +150,107 @@ WRITERS: dict[Lib, Callable[[pa.Table, Path, Codec], None]] = {
     "pyarrow": _write_pyarrow,
     "polars": _write_polars,
 }
+
+
+def _write_n2p_stream(profile: Profile, total_rows: int, chunk_rows: int, path: Path, codec: Codec) -> None:
+    with n2p_parquet.ParquetWriter(path, codec=codec) as writer:
+        for batch in iter_batches(profile, total_rows, chunk_rows):
+            writer.write_batch(batch)
+
+
+def _write_n2p_table_stream(profile: Profile, total_rows: int, chunk_rows: int, path: Path, codec: Codec) -> None:
+    table = pa.Table.from_batches(list(iter_batches(profile, total_rows, chunk_rows)))
+    n2p_parquet.write_table(table, path, codec=codec)
+
+
+def _write_pyarrow_stream(profile: Profile, total_rows: int, chunk_rows: int, path: Path, codec: Codec) -> None:
+    compression = "zstd" if codec == "zstd" else "none"
+    batches = iter_batches(profile, total_rows, chunk_rows)
+    first = next(batches)
+    with pq.ParquetWriter(path, first.schema, compression=compression) as writer:
+        writer.write_batch(first)
+        for batch in batches:
+            writer.write_batch(batch)
+
+
+STREAM_WRITERS: dict[StreamLib, Callable[[Profile, int, int, Path, Codec], None]] = {
+    "n2p_stream": _write_n2p_stream,
+    "n2p_table": _write_n2p_table_stream,
+    "pyarrow_stream": _write_pyarrow_stream,
+}
+
+
+def write_stream_once(
+    writer: Callable[[Profile, int, int, Path, Codec], None],
+    profile: Profile,
+    total_rows: int,
+    chunk_rows: int,
+    path: Path,
+    codec: Codec,
+) -> float:
+    _remove_path(path)
+    t0 = time.perf_counter()
+    writer(profile, total_rows, chunk_rows, path, codec)
+    return time.perf_counter() - t0
+
+
+def run_stream_one(
+    lib: StreamLib,
+    profile: Profile,
+    total_rows: int,
+    chunk_rows: int,
+    codec: Codec,
+    *,
+    repeat: int,
+    out_dir: Path,
+) -> StreamBenchRow:
+    writer = STREAM_WRITERS[lib]
+    path = out_dir / f"{lib}_{profile}_{codec}.parquet"
+    write_s = median_seconds(
+        lambda: write_stream_once(writer, profile, total_rows, chunk_rows, path, codec),
+        iters=repeat,
+    )
+    file_bytes = path.stat().st_size
+    mrows_per_s = total_rows / write_s / 1_000_000 if write_s else 0.0
+    return StreamBenchRow(
+        lib=lib,
+        profile=profile,
+        rows=total_rows,
+        chunk_rows=chunk_rows,
+        codec=codec,
+        write_s=write_s,
+        file_bytes=file_bytes,
+        mrows_per_s=mrows_per_s,
+    )
+
+
+def run_stream_matrix(
+    *,
+    profiles: list[Profile],
+    codecs: list[Codec],
+    total_rows: int,
+    chunk_rows: int,
+    repeat: int,
+    libs: list[StreamLib],
+    out_dir: Path,
+) -> list[StreamBenchRow]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    results: list[StreamBenchRow] = []
+    for profile in profiles:
+        for codec in codecs:
+            for lib in libs:
+                results.append(
+                    run_stream_one(
+                        lib,
+                        profile,
+                        total_rows,
+                        chunk_rows,
+                        codec,
+                        repeat=repeat,
+                        out_dir=out_dir,
+                    ),
+                )
+    return results
 
 
 def write_once(writer: Callable[[pa.Table, Path, Codec], None], table: pa.Table, path: Path, codec: Codec) -> float:

@@ -63,3 +63,30 @@ def test_parquet_profile_bench(profile):
     # ZSTD size should stay close; uncompressed string layouts differ by encoder.
     errors = check_results(results, max_write_ratio=5.0, max_size_ratio=1.15, size_codecs=("zstd",))
     assert not errors, "; ".join(errors)
+
+
+@pytest.mark.bench
+def test_streaming_writer_bench():
+    from bench.common import run_stream_matrix
+
+    with tempfile.TemporaryDirectory() as tmp:
+        results = run_stream_matrix(
+            profiles=["mixed"],
+            codecs=["zstd"],
+            total_rows=300_000,
+            chunk_rows=50_000,
+            repeat=2,
+            libs=["n2p_stream", "pyarrow_stream"],
+            out_dir=Path(tmp),
+        )
+
+    by_lib = {row.lib: row for row in results}
+    stream = by_lib["n2p_stream"]
+    pyarrow = by_lib["pyarrow_stream"]
+    ratio = stream.write_s / max(pyarrow.write_s, 1e-9)
+    print(
+        f"streaming mixed/zstd: n2p_stream={stream.write_s:.3f}s "
+        f"pyarrow_stream={pyarrow.write_s:.3f}s ratio={ratio:.2f}x"
+    )
+    assert stream.file_bytes > 0
+    assert ratio < 5.0

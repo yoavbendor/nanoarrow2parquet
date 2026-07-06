@@ -25,8 +25,10 @@ from bench.common import (  # noqa: E402
     Codec,
     Lib,
     Profile,
+    StreamLib,
     check_results,
     run_matrix,
+    run_stream_matrix,
 )
 
 
@@ -46,6 +48,8 @@ def main() -> int:
     ap.add_argument("--max-write-ratio", type=float, default=5.0)
     ap.add_argument("--max-size-ratio", type=float, default=1.15)
     ap.add_argument("--quick", action="store_true", help="smoke: 50k rows, 1 repeat")
+    ap.add_argument("--streaming", action="store_true", help="benchmark chunked ParquetWriter loops")
+    ap.add_argument("--chunk-rows", type=int, default=100_000, help="rows per chunk when --streaming")
     args = ap.parse_args()
 
     profiles: list[Profile] = _parse_list(args.profiles)  # type: ignore[assignment]
@@ -53,42 +57,73 @@ def main() -> int:
     libs: list[Lib] = _parse_list(args.libs)  # type: ignore[assignment]
     rows = 50_000 if args.quick else args.rows
     repeat = 1 if args.quick else args.repeat
+    chunk_rows = min(args.chunk_rows, rows) if args.quick else args.chunk_rows
 
-    if "polars" in libs:
-        try:
-            import polars  # noqa: F401
-        except ImportError:
-            sys.stderr.write("polars not installed; skipping polars baseline\n")
-            libs = [lib for lib in libs if lib != "polars"]
+    if args.streaming:
+        stream_libs: list[StreamLib] = ["n2p_stream", "n2p_table", "pyarrow_stream"]
+        with tempfile.TemporaryDirectory(prefix="nanoarrow-io-stream-bench-") as tmp:
+            results = run_stream_matrix(
+                profiles=profiles,
+                codecs=codecs,
+                total_rows=rows,
+                chunk_rows=chunk_rows,
+                repeat=repeat,
+                libs=stream_libs,
+                out_dir=Path(tmp),
+            )
+        payload = [{"mode": "stream", **row.to_json()} for row in results]
+    else:
+        if "polars" in libs:
+            try:
+                import polars  # noqa: F401
+            except ImportError:
+                sys.stderr.write("polars not installed; skipping polars baseline\n")
+                libs = [lib for lib in libs if lib != "polars"]
 
-    with tempfile.TemporaryDirectory(prefix="nanoarrow-io-bench-") as tmp:
-        results = run_matrix(
-            profiles=profiles,
-            codecs=codecs,
-            rows=rows,
-            repeat=repeat,
-            libs=libs,
-            out_dir=Path(tmp),
-        )
+        with tempfile.TemporaryDirectory(prefix="nanoarrow-io-bench-") as tmp:
+            results = run_matrix(
+                profiles=profiles,
+                codecs=codecs,
+                rows=rows,
+                repeat=repeat,
+                libs=libs,
+                out_dir=Path(tmp),
+            )
+        payload = [{"mode": "table", **row.to_json()} for row in results]
 
-    payload = [row.to_json() for row in results]
     if args.json_path:
         with open(args.json_path, "w") as f:
             json.dump(payload, f, indent=2)
             f.write("\n")
 
-    hdr = f"{'profile':>12} {'rows':>8} {'codec':>12} {'lib':>8} {'write_s':>8} {'MB':>8} {'Mrows/s':>8}"
+    if args.streaming:
+        hdr = (
+            f"{'profile':>12} {'rows':>8} {'chunk':>8} {'codec':>12} {'lib':>14} "
+            f"{'write_s':>8} {'MB':>8} {'Mrows/s':>8}"
+        )
+    else:
+        hdr = f"{'profile':>12} {'rows':>8} {'codec':>12} {'lib':>8} {'write_s':>8} {'MB':>8} {'Mrows/s':>8}"
     print(hdr)
     print("-" * len(hdr))
-    for row in results:
-        print(
-            f"{row.profile:>12} {row.rows:>8} {row.codec:>12} {row.lib:>8} "
-            f"{row.write_s:>8.3f} {row.file_bytes / 2**20:>8.2f} {row.mrows_per_s:>8.2f}"
-        )
+    for row in payload:
+        if row.get("mode") == "stream":
+            print(
+                f"{row['profile']:>12} {row['rows']:>8} {row['chunk_rows']:>8} {row['codec']:>12} "
+                f"{row['lib']:>14} {row['write_s']:>8.3f} {row['file_bytes'] / 2**20:>8.2f} "
+                f"{row['mrows_per_s']:>8.2f}"
+            )
+        else:
+            print(
+                f"{row['profile']:>12} {row['rows']:>8} {row['codec']:>12} {row['lib']:>8} "
+                f"{row['write_s']:>8.3f} {row['file_bytes'] / 2**20:>8.2f} {row['mrows_per_s']:>8.2f}"
+            )
 
-    if args.check:
+    if args.check and not args.streaming:
+        from bench.common import BenchRow
+
+        table_results = [BenchRow(**{k: row[k] for k in BenchRow.__dataclass_fields__}) for row in payload]
         errors = check_results(
-            results,
+            table_results,
             max_write_ratio=args.max_write_ratio,
             max_size_ratio=args.max_size_ratio,
             size_codecs=("zstd",),
