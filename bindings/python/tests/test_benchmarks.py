@@ -2,68 +2,64 @@
 
 from __future__ import annotations
 
-import os
-import statistics
-import time
+import tempfile
+from pathlib import Path
 
-import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from nanoarrow_io import parquet
-
-
-def _mb(path: os.PathLike) -> float:
-    return os.path.getsize(path) / (1024 * 1024)
-
-
-def _median_seconds(fn, *, iters: int = 3) -> float:
-    return statistics.median(fn() for _ in range(iters))
-
-
-def _write_once(write_fn, table: pa.Table, path) -> float:
-    if os.path.exists(path):
-        if os.path.isdir(path):
-            import shutil
-
-            shutil.rmtree(path)
-        else:
-            os.remove(path)
-    t0 = time.perf_counter()
-    write_fn(table, path)
-    return time.perf_counter() - t0
+from bench.common import check_results, run_matrix
 
 
 @pytest.mark.bench
-def test_parquet_write_speed_and_size(tmp_path):
-    n = 500_000
-    table = pa.table(
-        {
-            "id": pa.array(range(n), type=pa.int64()),
-            "tag": pa.array([f"row-{i % 1000}" for i in range(n)], type=pa.string()),
-            "value": pa.array([float(i) * 0.01 for i in range(n)], type=pa.float64()),
-        }
-    )
+def test_parquet_write_speed_and_size():
+    with tempfile.TemporaryDirectory() as tmp:
+        out_dir = Path(tmp)
+        results = run_matrix(
+            profiles=["mixed"],
+            codecs=["zstd"],
+            rows=500_000,
+            repeat=3,
+            libs=["n2p", "pyarrow", "polars"],
+            out_dir=out_dir,
+        )
 
-    n2p_path = tmp_path / "n2p.parquet"
-    n2p_s = _median_seconds(
-        lambda: _write_once(lambda t, p: parquet.write_table(t, p, codec="zstd"), table, n2p_path),
-    )
-    n2p_sz = _mb(n2p_path)
+        by_lib = {row.lib: row for row in results}
+        n2p = by_lib["n2p"]
+        arrow = by_lib["pyarrow"]
 
-    arrow_path = tmp_path / "arrow.parquet"
-    arrow_s = _median_seconds(
-        lambda: _write_once(lambda t, p: pq.write_table(t, p, compression="zstd"), table, arrow_path),
-    )
-    arrow_sz = _mb(arrow_path)
+        assert pq.read_table(out_dir / "n2p_mixed_zstd.parquet").num_rows == 500_000
+        ratio = n2p.write_s / max(arrow.write_s, 1e-9)
+        size_ratio = n2p.file_bytes / max(arrow.file_bytes, 1e-9)
+        print(
+            f"parquet write (mixed/zstd): n2p={n2p.write_s:.3f}s pyarrow={arrow.write_s:.3f}s "
+            f"ratio={ratio:.2f}x; size n2p={n2p.file_bytes / 2**20:.2f}MB "
+            f"pyarrow={arrow.file_bytes / 2**20:.2f}MB ratio={size_ratio:.2f}x"
+        )
+        if "polars" in by_lib:
+            pl = by_lib["polars"]
+            print(
+                f"polars={pl.write_s:.3f}s size={pl.file_bytes / 2**20:.2f}MB "
+                f"n2p/polars={pl.write_s / max(n2p.write_s, 1e-9):.2f}x"
+            )
 
-    assert pq.read_table(n2p_path).num_rows == n
-    assert pq.read_table(arrow_path).num_rows == n
+        errors = check_results(results, max_write_ratio=5.0, max_size_ratio=1.15)
+        assert not errors, "; ".join(errors)
 
-    ratio = n2p_s / max(arrow_s, 1e-9)
-    size_ratio = n2p_sz / max(arrow_sz, 1e-9)
-    print(
-        f"parquet write: n2p={n2p_s:.3f}s arrow={arrow_s:.3f}s ratio={ratio:.2f}x; "
-        f"size n2p={n2p_sz:.2f}MB arrow={arrow_sz:.2f}MB ratio={size_ratio:.2f}x"
-    )
-    assert ratio < 5.0
+
+@pytest.mark.bench
+@pytest.mark.parametrize("profile", ["numeric", "string_dict"])
+def test_parquet_profile_bench(profile):
+    with tempfile.TemporaryDirectory() as tmp:
+        results = run_matrix(
+            profiles=[profile],  # type: ignore[list-item]
+            codecs=["zstd", "uncompressed"],
+            rows=200_000,
+            repeat=2,
+            libs=["n2p", "pyarrow", "polars"],
+            out_dir=Path(tmp),
+        )
+
+    # ZSTD size should stay close; uncompressed string layouts differ by encoder.
+    errors = check_results(results, max_write_ratio=5.0, max_size_ratio=1.15, size_codecs=("zstd",))
+    assert not errors, "; ".join(errors)
