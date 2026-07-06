@@ -5,6 +5,7 @@ from __future__ import annotations
 import pyarrow as pa
 import pytest
 
+
 @pytest.fixture
 def sample_table() -> pa.Table:
     return pa.table(
@@ -19,12 +20,6 @@ def sample_table() -> pa.Table:
             "fsb": [bytes([i, i + 1, i + 2, i + 3]) for i in range(5)],
         }
     )
-
-
-@pytest.fixture
-def pylance_interop_table() -> pa.Table:
-    """Small table known to round-trip through both nanolance and pylance."""
-    return pa.table({"id": [1, 2, 3], "name": ["alpha", "beta", "gamma"]})
 
 
 @pytest.fixture

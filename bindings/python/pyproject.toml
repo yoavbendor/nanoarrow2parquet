@@ -5,12 +5,12 @@ build-backend = "scikit_build_core.build"
 [project]
 name = "nanoarrow-io"
 version = "0.1.0"
-description = "Fast zero-copy Python bindings for nanoarrow2parquet and nanolance"
+description = "Fast zero-copy Python bindings for nanoarrow2parquet (Parquet + NumPy bridge)"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Yoav Bendor" }]
-keywords = ["arrow", "parquet", "lance", "zero-copy", "nanoarrow"]
+keywords = ["arrow", "parquet", "zero-copy", "nanoarrow", "numpy"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -22,8 +22,8 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=7", "pyarrow>=16", "pandas>=2", "polars>=1", "psutil>=5.9", "pylance>=0.17", "numpy>=1.23"]
-bench = ["pyarrow>=16", "psutil>=5.9", "pylance>=0.17", "numpy>=1.23"]
+test = ["pytest>=7", "pyarrow>=16", "pandas>=2", "polars>=1", "psutil>=5.9", "numpy>=1.23"]
+bench = ["pyarrow>=16", "psutil>=5.9", "numpy>=1.23"]
 numpy = ["numpy>=1.23"]
 
 [project.urls]

@@ -7,7 +7,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from nanoarrow_io import nanolance, numpy as naio_numpy, parquet
+from nanoarrow_io import numpy as naio_numpy, parquet
 
 
 @pytest.fixture
@@ -35,17 +35,6 @@ def test_numpy_parquet_roundtrip(numeric_columns, tmp_path):
     table = pq.read_table(path)
     assert table.num_rows == n
     assert table.column("id").to_numpy().tolist() == numeric_columns["id"].tolist()
-
-
-def test_numpy_lance_roundtrip(numeric_columns, tmp_path):
-    batch = naio_numpy.record_batch(numeric_columns)
-    n = batch.length
-    path = tmp_path / "from_numpy.lance"
-    nanolance.write_table(batch, path, compression=False)
-
-    roundtrip = pa.table(nanolance.read_table(path))
-    assert roundtrip.num_rows == n
-    assert roundtrip.column("id").to_numpy().tolist() == numeric_columns["id"].tolist()
 
 
 def test_rejects_non_contiguous():

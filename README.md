@@ -77,21 +77,21 @@ statistics / indexes, bloom filters, `DELTA_*` / `BYTE_STREAM_SPLIT` encodings.
 
 ## Python bindings (`nanoarrow-io`)
 
-Fast zero-copy Python bindings for **nanoarrow2parquet** and **[nanolance](https://github.com/yoavbendor/nanolance)** live under [`bindings/python/`](bindings/python/). They follow the same [nanom](https://github.com/yoavbendor/nanom) pattern: `scikit-build-core` + `nanobind`, Arrow PyCapsule import/export, no hard pyarrow dependency at runtime.
+Fast zero-copy Python bindings for **nanoarrow2parquet** (Parquet + NumPy bridge) live under [`bindings/python/`](bindings/python/). Lance I/O is a separate package in **[nanolance](https://github.com/yoavbendor/nanolance)** (`bindings/python/` there).
 
 ```python
 import pyarrow as pa
-from nanoarrow_io import parquet, nanolance
+from nanoarrow_io import parquet
+import nanolance  # pip install from nanolance repo
 
 table = pa.table({"id": [1, 2, 3], "name": ["a", "b", "c"]})
-parquet.write_table(table, "out.parquet")          # nanoarrow2parquet
-nanolance.write_table(table, "out.lance", compression=True)  # nanolance
-roundtrip = pa.table(nanolance.read_table("out.lance"))
+parquet.write_table(table, "out.parquet")
+nanolance.write_table(table, "out.lance", compression=True)
 ```
 
-The Lance submodule is named **`nanolance`** (not `lance`) so it does not shadow the official SDK (`pip install pylance` → `import lance`). See [`bindings/python/README.md`](bindings/python/README.md).
+The same Arrow table feeds either writer. Official Lance SDK: `pip install pylance` → `import lance` (complementary, not replaced).
 
-Install for development: `pip install -e "bindings/python[test]"` then `pytest` in that directory. See [`bindings/python/README.md`](bindings/python/README.md).
+Install: `pip install -e "bindings/python[test]"` then `pytest` in that directory. See [`bindings/python/README.md`](bindings/python/README.md).
 
 ## For AI agents
 

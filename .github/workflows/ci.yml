@@ -90,7 +90,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .deps
-          key: deps-bindings-${{ runner.os }}-${{ hashFiles('CMakeLists.txt', 'bindings/python/CMakeLists.txt', 'patches/nanolance-structural-dict.patch') }}
+          key: deps-bindings-${{ runner.os }}-${{ hashFiles('CMakeLists.txt', 'bindings/python/CMakeLists.txt') }}
 
       - name: Install package + test deps
         working-directory: bindings/python
