@@ -77,21 +77,20 @@ statistics / indexes, bloom filters, `DELTA_*` / `BYTE_STREAM_SPLIT` encodings.
 
 ## Python bindings (`nanoarrow-io`)
 
-Fast zero-copy Python bindings for **nanoarrow2parquet** and **[nanolance](https://github.com/yoavbendor/nanolance)** live under [`bindings/python/`](bindings/python/). They follow the same [nanom](https://github.com/yoavbendor/nanom) pattern: `scikit-build-core` + `nanobind`, Arrow PyCapsule import/export, no hard pyarrow dependency at runtime.
+Fast zero-copy Python bindings for **nanoarrow2parquet** live under [`bindings/python/`](bindings/python/). They follow the same [nanom](https://github.com/yoavbendor/nanom) pattern: `scikit-build-core` + `nanobind`, Arrow PyCapsule import/export, no hard pyarrow dependency at runtime.
 
 ```python
 import pyarrow as pa
-from nanoarrow_io import parquet, nanolance
+from nanoarrow_io import parquet
 
 table = pa.table({"id": [1, 2, 3], "name": ["a", "b", "c"]})
-parquet.write_table(table, "out.parquet")          # nanoarrow2parquet
-nanolance.write_table(table, "out.lance", compression=True)  # nanolance
-roundtrip = pa.table(nanolance.read_table("out.lance"))
+parquet.write_table(table, "out.parquet")
+assert pa.parquet.read_table("out.parquet").equals(table)
 ```
 
-The Lance submodule is named **`nanolance`** (not `lance`) so it does not shadow the official SDK (`pip install pylance` → `import lance`). See [`bindings/python/README.md`](bindings/python/README.md).
+For Lance datasets, use the sibling [nanolance](https://github.com/yoavbendor/nanolance) Python package (`pip install -e bindings/python` in that repo → `import nanolance`). The same Arrow table can feed either writer. See [nanolance PR #40](https://github.com/yoavbendor/nanolance/pull/40) and [`bindings/python/README.md`](bindings/python/README.md).
 
-Install for development: `pip install -e "bindings/python[test]"` then `pytest` in that directory. See [`bindings/python/README.md`](bindings/python/README.md).
+Install for development: `pip install -e "bindings/python[test]"` then `pytest -m "not bench"` in that directory.
 
 ## For AI agents
 

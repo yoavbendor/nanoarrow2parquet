@@ -22,12 +22,6 @@ def sample_table() -> pa.Table:
 
 
 @pytest.fixture
-def pylance_interop_table() -> pa.Table:
-    """Small table known to round-trip through both nanolance and pylance."""
-    return pa.table({"id": [1, 2, 3], "name": ["alpha", "beta", "gamma"]})
-
-
-@pytest.fixture
 def nullable_table() -> pa.Table:
     return pa.table(
         {
