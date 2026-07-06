@@ -18,7 +18,7 @@ if(NOT DEFINED FETCHCONTENT_BASE_DIR)
     set(FETCHCONTENT_BASE_DIR "${N2P_ROOT}/.deps" CACHE PATH "Fetched dependency sources")
 endif()
 
-# --- nanoarrow with IPC (required by nanolance) ---
+# --- nanoarrow (IPC for NumPy bridge record batches) ---
 include(FetchContent)
 set(NANOARROW_IPC ON CACHE BOOL "" FORCE)
 set(NANOARROW_IPC_WITH_ZSTD OFF CACHE BOOL "" FORCE)
@@ -31,7 +31,7 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(nanoarrow)
 
-# --- zstd (page compression; shared by n2p + nanolance) ---
+# --- zstd (page compression for nanoarrow2parquet) ---
 if(NOT TARGET libzstd_static)
     set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
     set(ZSTD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -46,21 +46,7 @@ if(NOT TARGET libzstd_static)
     FetchContent_MakeAvailable(_nanoarrow_io_zstd)
 endif()
 
-# --- nanolance (pinned sibling project) ---
-set(NANOLANCE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(NANOLANCE_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
-set(NANOLANCE_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(NANOLANCE_BUILD_FUSE_EXAMPLE OFF CACHE BOOL "" FORCE)
-set(NANOLANCE_ENABLE_S3 OFF CACHE BOOL "" FORCE)
-FetchContent_Declare(
-    nanolance
-    GIT_REPOSITORY https://github.com/yoavbendor/nanolance.git
-    GIT_TAG 08e1bd4ee8060f4a9aea473b1b80e8e3246a342b
-    GIT_SHALLOW FALSE
-)
-FetchContent_MakeAvailable(nanolance)
-
-# --- nanoarrow2parquet (reuses nanoarrow from nanolance) ---
+# --- nanoarrow2parquet ---
 set(N2P_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(N2P_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(N2P_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
@@ -79,12 +65,8 @@ nanobind_add_module(_n2p STABLE_ABI NB_STATIC src/n2p_bindings.cpp)
 target_include_directories(_n2p PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(_n2p PRIVATE nanoarrow2parquet::nanoarrow2parquet nanoarrow_static)
 
-nanobind_add_module(_nanolance STABLE_ABI NB_STATIC src/nanolance_bindings.cpp)
-target_include_directories(_nanolance PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(_nanolance PRIVATE nanolance::nanolance nanoarrow_static)
-
 nanobind_add_module(_numpy STABLE_ABI NB_STATIC src/numpy_bindings.cpp)
 target_include_directories(_numpy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(_numpy PRIVATE nanoarrow_static)
 
-install(TARGETS _n2p _nanolance _numpy LIBRARY DESTINATION nanoarrow_io)
+install(TARGETS _n2p _numpy LIBRARY DESTINATION nanoarrow_io)
