@@ -108,6 +108,78 @@ void write_batch(nb::handle batch, const std::filesystem::path& path, std::strin
     }
 }
 
+class ParquetWriter {
+public:
+    ParquetWriter(const std::filesystem::path& path, N2PCodec codec) {
+        int rc = n2p_writer_open(&writer_, path.string().c_str());
+        if (rc != N2P_OK) {
+            throw_n2p("n2p_writer_open", rc, writer_ ? n2p_writer_last_error(writer_) : "");
+        }
+        rc = n2p_writer_set_codec(writer_, codec);
+        if (rc != N2P_OK) {
+            const char* err = n2p_writer_last_error(writer_);
+            n2p_writer_close(writer_);
+            writer_ = nullptr;
+            throw_n2p("n2p_writer_set_codec", rc, err);
+        }
+    }
+
+    ParquetWriter(const ParquetWriter&) = delete;
+    ParquetWriter& operator=(const ParquetWriter&) = delete;
+
+    ~ParquetWriter() {
+        if (writer_ != nullptr) {
+            n2p_writer_close(writer_);
+            writer_ = nullptr;
+        }
+    }
+
+    void write_batch(nb::handle batch) {
+        ensure_open();
+        auto imported = nanoarrow_io::arrow_capsule::import_batch(batch);
+        int rc = n2p_writer_write_batch(writer_, imported.first.get(), imported.second.get());
+        if (rc != N2P_OK) {
+            throw_n2p("n2p_writer_write_batch", rc, n2p_writer_last_error(writer_));
+        }
+        ++row_groups_;
+        num_rows_ += imported.second->length;
+    }
+
+    void close() {
+        if (writer_ == nullptr) {
+            return;
+        }
+        if (row_groups_ == 0) {
+            N2PWriter* w = writer_;
+            writer_ = nullptr;
+            n2p_writer_close(w);
+            throw std::runtime_error("cannot close ParquetWriter without writing at least one batch");
+        }
+        int rc = n2p_writer_close(writer_);
+        writer_ = nullptr;
+        if (rc != N2P_OK) {
+            throw_n2p("n2p_writer_close", rc, "");
+        }
+    }
+
+    bool closed() const { return writer_ == nullptr; }
+
+    std::int64_t row_groups() const { return row_groups_; }
+
+    std::int64_t num_rows() const { return num_rows_; }
+
+private:
+    void ensure_open() const {
+        if (writer_ == nullptr) {
+            throw std::runtime_error("ParquetWriter is closed");
+        }
+    }
+
+    N2PWriter* writer_ = nullptr;
+    std::int64_t row_groups_ = 0;
+    std::int64_t num_rows_ = 0;
+};
+
 }  // namespace
 
 NB_MODULE(_n2p, m) {
@@ -122,6 +194,22 @@ NB_MODULE(_n2p, m) {
           nb::arg("codec") = "zstd",
           nb::rv_policy::move,
           "Write a single Arrow RecordBatch to a one-row-group Parquet file.");
+
+    nb::class_<ParquetWriter>(m, "ParquetWriter")
+        .def(
+            "__init__",
+            [](ParquetWriter* self, const std::filesystem::path& path, std::string_view codec) {
+                new (self) ParquetWriter(path, parse_codec(codec));
+            },
+            nb::arg("path"),
+            nb::arg("codec") = "zstd",
+            "Open a streaming Parquet writer (one row group per write_batch call).")
+        .def("write_batch", &ParquetWriter::write_batch, nb::arg("batch"),
+             "Append one record batch as a row group.")
+        .def("close", &ParquetWriter::close, "Write the footer and close the file.")
+        .def_prop_ro("closed", &ParquetWriter::closed)
+        .def_prop_ro("row_groups", &ParquetWriter::row_groups)
+        .def_prop_ro("num_rows", &ParquetWriter::num_rows);
 
     nb::enum_<N2PCodec>(m, "Codec")
         .value("ZSTD", N2P_CODEC_ZSTD)
