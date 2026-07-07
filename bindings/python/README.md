@@ -48,6 +48,27 @@ parquet.write_table(table, "out.parquet")
 assert pa.parquet.read_table("out.parquet").equals(table)
 ```
 
+### Chunked write (larger than RAM)
+
+```python
+import pyarrow as pa
+from nanoarrow_io import parquet
+
+schema = pa.schema([("id", pa.int64()), ("value", pa.float64())])
+with parquet.ParquetWriter("big.parquet", codec="zstd") as writer:
+    for chunk_id in range(10_000):
+        batch = pa.record_batch(
+            {
+                "id": pa.array(range(chunk_id * 5_000, (chunk_id + 1) * 5_000)),
+                "value": pa.array([float(i) for i in range(5_000)]),
+            },
+            schema=schema,
+        )
+        writer.write_batch(batch)
+        del batch  # only one chunk in memory at a time
+# close() writes the footer → valid multi-row-group file
+```
+
 ### NumPy (zero-copy columns)
 
 ```python
@@ -75,28 +96,9 @@ Columns must be 1-D, C-contiguous, and use a supported numeric dtype (bool, int/
 
 ## Streaming writes (larger than RAM)
 
-`write_table` already maps each Arrow record batch to one row group, but it still requires the
-full table (or stream) to be iterable from Python. For capture pipelines that **generate one chunk
-at a time**, use :class:`~nanoarrow_io.parquet.ParquetWriter`:
-
-```python
-import pyarrow as pa
-from nanoarrow_io import parquet
-
-schema = pa.schema([("id", pa.int64()), ("value", pa.float64())])
-with parquet.ParquetWriter("capture.parquet", codec="zstd") as writer:
-    for chunk_id in range(10_000):
-        batch = pa.record_batch(
-            {
-                "id": pa.array(range(chunk_id * 5_000, (chunk_id + 1) * 5_000)),
-                "value": pa.array([float(i) for i in range(5_000)]),
-            },
-            schema=schema,
-        )
-        writer.write_batch(batch)
-        del batch  # drop the chunk before generating the next one
-# writer.close() runs automatically; footer is written here
-```
+`write_table` maps each Arrow record batch to one row group, but it still requires the full table
+(or stream) to be iterable from Python. For capture pipelines that **generate one chunk at a time**,
+use :class:`~nanoarrow_io.parquet.ParquetWriter` (same pattern as the [Quick start](#chunked-write-larger-than-ram) example above).
 
 **Rules:**
 
