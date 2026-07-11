@@ -255,6 +255,9 @@ if(N2P_BUILD_TESTS)
     add_executable(test_soa_struct tests/test_soa_struct.cpp)
     target_link_libraries(test_soa_struct PRIVATE nanoarrow2parquet)
 
+    add_executable(test_soa_fixed_binary tests/test_soa_fixed_binary.cpp)
+    target_link_libraries(test_soa_fixed_binary PRIVATE nanoarrow2parquet)
+
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
         # End-to-end: pcapng2parquet decodes a synthesized capture (Ethernet/IPv4/UDP + LLDP) and the
@@ -321,6 +324,12 @@ if(N2P_BUILD_TESTS)
                      "$<TARGET_FILE:test_soa_struct> ${CMAKE_CURRENT_BINARY_DIR}/n2p_soa_struct.parquet && \
                       ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_soa_struct.py \
                       ${CMAKE_CURRENT_BINARY_DIR}/n2p_soa_struct.parquet")
+
+        add_test(NAME soa_fixed_binary_roundtrip
+                 COMMAND bash -c
+                     "$<TARGET_FILE:test_soa_fixed_binary> ${CMAKE_CURRENT_BINARY_DIR}/n2p_soa_fixed_binary.parquet && \
+                      ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_soa_fixed_binary.py \
+                      ${CMAKE_CURRENT_BINARY_DIR}/n2p_soa_fixed_binary.parquet")
 
         add_test(NAME mixed_types_roundtrip
                  COMMAND bash -c
