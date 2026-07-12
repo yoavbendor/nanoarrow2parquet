@@ -116,6 +116,37 @@ N2P_SOA_TRAIT(float,         "f");
 N2P_SOA_TRAIT(double,        "g");
 #undef N2P_SOA_TRAIT
 
+// std::array<uint8_t, N> columns map to Arrow fixed_size_binary ("w:N") -- the writer back-end
+// (src/writer.cpp) already understands this format string (FIXED_LEN_BYTE_ARRAY, MemcpyFixed); the
+// only missing piece was this compile-time trait, so a range of std::array<uint8_t, N> (MAC
+// addresses, IPv4/IPv6 addresses, PTP clock identities, ...) can be handed to Writer<Fields...>
+// exactly like any other fixed-width column -- zero-copy, the column's own storage is the Parquet
+// data page. The "w:N" string is composed at compile time (no snprintf/to_string at runtime).
+template <std::size_t N>
+struct fixed_size_binary_format {
+    static consteval std::size_t digits() {
+        std::size_t d = 1;
+        for (std::size_t v = N; v >= 10; v /= 10) ++d;
+        return d;
+    }
+    static consteval auto make() {
+        std::array<char, 2 + digits() + 1> out{};
+        out[0] = 'w';
+        out[1] = ':';
+        std::size_t v = N;
+        for (std::size_t i = digits(); i > 0; --i) {
+            out[1 + i] = static_cast<char>('0' + v % 10);
+            v /= 10;
+        }
+        return out;
+    }
+    static constexpr auto storage = make();
+};
+template <std::size_t N>
+struct arrow_traits<std::array<std::uint8_t, N>> {
+    static constexpr const char* format = fixed_size_binary_format<N>::storage.data();
+};
+
 // Variable-length field tags. Unlike the numeric types these are not zero-copy:
 // a SoA string column (range of string-like values) is materialized into Arrow
 // offsets + data buffers per chunk. The large_* variants use 64-bit offsets.
