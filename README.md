@@ -18,9 +18,11 @@ representation, so it controls the complexity:
   data is high-cardinality and the dictionary would be larger than the raw bytes.
 - Every page body is **compressed** (ZSTD by default).
 
-The only real format work is a small Thrift *compact protocol* encoder
-(`src/thrift_compact.hpp`) and the metadata structs (`src/parquet_types.hpp`,
-`src/writer.cpp`) — no Thrift library, no SIMD, no decode path.
+Page headers and the footer are the Parquet model of [nanom](https://github.com/yoavbendor/nanom)
+(`nanom/formats/parquet_thrift.hpp`). It is the same set of structs the
+[parquet2nanoarrow](https://github.com/yoavbendor/parquet2nanoarrow) reader decodes, and nanom's
+Thrift compact encoder (`nanom/tagged_encode.hpp`) writes it. There is no Thrift library, no
+hand-written encoder, and no second copy of `parquet.thrift` to drift out of sync.
 
 ## Scope
 
@@ -282,7 +284,7 @@ implementation macro first:
 
 Everywhere else, `#include "nanoarrow2parquet.h"` with no macro for just the C ABI.
 This is link-time equivalent to compiling `src/writer.cpp`: the header still needs
-the **nanoarrow** and **zstd** headers on the include path and links **libzstd**
+the **nanoarrow**, **zstd** and (header-only) **nanom** headers on the include path and links **libzstd**
 (use `N2P_CODEC_UNCOMPRESSED` if you want to avoid zstd at runtime). With CMake,
 link `nanoarrow2parquet::single` instead of the static library.
 
@@ -319,13 +321,22 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-Dependencies (`nanoarrow`, `zstd`) are fetched via CMake `FetchContent`; nanoarrow
-is pinned to the same commit nanolance uses. Embedding parents that already provide
+Dependencies (`nanoarrow`, `zstd`, and the header-only `nanom`) are fetched via CMake
+`FetchContent`; nanoarrow is pinned to the same commit nanolance uses, nanom to a commit
+(`-DFETCHCONTENT_SOURCE_DIR_NANOM=/path` develops against a local checkout). Embedding parents that already provide
 `nanoarrow_static` / a `zstd` target are reused automatically.
 
 `ctest` runs:
-- `test_roundtrip` — unit checks of the compact-protocol encoder, the RLE/bit-pack
-  encoder, file framing, and null rejection.
+- `test_roundtrip` — unit checks of the RLE/bit-pack encoder, file framing and null
+  rejection. The written footer and every page header are decoded back through nanom's model:
+  pages must tile each column chunk and the value counts must add up.
+- `oracle_roundtrip` — format correctness against independent readers. A matrix of tables is
+  written through the C API and must read back exactly in **pyarrow** and **arrow-rs** (the Rust
+  `parquet` crate, `tests/arrow_rs_oracle`, built by cargo when available), and in
+  **parquet2nanoarrow** when `-DN2P_P2N_C_LIB=` points at its C library. The matrix covers every
+  supported type, nulls at every level, nested structs, several row groups, empty / unicode /
+  long strings, NaN and ±0, and both codecs. The footer as arrow-rs decodes it must match
+  pyarrow's field by field, and the column chunks must tile the file.
 - `test_single_header` — compiles two TUs against the amalgamated header (one
   defining `NANOARROW2PARQUET_IMPLEMENTATION`) and writes a file, proving the
   single-header build compiles and links with no ODR clashes.

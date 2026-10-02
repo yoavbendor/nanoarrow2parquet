@@ -220,6 +220,13 @@ endif()
 
 if(N2P_BUILD_TESTS)
     enable_testing()
+
+    # The writer as a shared C library, so tests/oracle_roundtrip.py can drive it from Python
+    # (ctypes + the Arrow C Data Interface) with any pyarrow table.
+    add_library(n2p_oracle_c SHARED src/writer.cpp)
+    target_include_directories(n2p_oracle_c PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(n2p_oracle_c PRIVATE nanoarrow_static nanom::nanom ${N2P_ZSTD_TARGET})
     add_executable(test_roundtrip tests/test_roundtrip.cpp)
     target_include_directories(test_roundtrip PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(test_roundtrip PRIVATE nanoarrow2parquet nanoarrow_static nanom::nanom)
@@ -290,6 +297,28 @@ if(N2P_BUILD_TESTS)
                              ${CMAKE_CURRENT_SOURCE_DIR}/examples/pcapng2parquet/tests/check_pcapng2parquet.py
                              $<TARGET_FILE:pcapng2parquet>)
             set_tests_properties(pcapng2parquet_check PROPERTIES SKIP_RETURN_CODE 77)
+        endif()
+
+        # Format correctness against independent readers: every written table must read back
+        # exactly in pyarrow, arrow-rs (tests/arrow_rs_oracle, built by cargo when available) and,
+        # when N2P_P2N_C_LIB points at libparquet2nanoarrow_c, parquet2nanoarrow; footers must agree.
+        set(N2P_P2N_C_LIB "-" CACHE STRING "parquet2nanoarrow C ABI library for the oracle test (- = skip)")
+        find_program(N2P_CARGO cargo)
+        set(_n2p_rs_oracle "-")
+        if(N2P_CARGO)
+            set(_n2p_rs_dir ${CMAKE_CURRENT_SOURCE_DIR}/tests/arrow_rs_oracle)
+            add_test(NAME build_arrow_rs_oracle
+                     COMMAND ${N2P_CARGO} build --release --quiet --manifest-path ${_n2p_rs_dir}/Cargo.toml
+                             --target-dir ${CMAKE_CURRENT_BINARY_DIR}/arrow_rs_oracle)
+            set_tests_properties(build_arrow_rs_oracle PROPERTIES FIXTURES_SETUP arrow_rs_oracle TIMEOUT 1800)
+            set(_n2p_rs_oracle ${CMAKE_CURRENT_BINARY_DIR}/arrow_rs_oracle/release/arrow_rs_oracle)
+        endif()
+        add_test(NAME oracle_roundtrip
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/oracle_roundtrip.py
+                         $<TARGET_FILE:n2p_oracle_c> ${_n2p_rs_oracle} ${N2P_P2N_C_LIB})
+        set_tests_properties(oracle_roundtrip PROPERTIES SKIP_RETURN_CODE 77)
+        if(N2P_CARGO)
+            set_tests_properties(oracle_roundtrip PROPERTIES FIXTURES_REQUIRED arrow_rs_oracle)
         endif()
 
         add_test(NAME smoke_pyarrow

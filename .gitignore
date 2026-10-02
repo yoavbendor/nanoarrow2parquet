@@ -12,3 +12,4 @@ compile_commands.json
 *.a
 # Local test artifacts
 *.parquet
+tests/arrow_rs_oracle/target/

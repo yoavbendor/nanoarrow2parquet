@@ -1,0 +1,16 @@
+[package]
+name = "arrow_rs_oracle"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Reference reader for tests/oracle_roundtrip.py: reads a Parquet file with the Apache Arrow Rust
+# `parquet` crate, writes the decoded data as an Arrow IPC file (compared exactly by pyarrow) and
+# prints the footer metadata as JSON.
+[dependencies]
+parquet = { version = "60", default-features = false, features = ["arrow", "zstd"] }
+arrow-ipc = "60"
+arrow-array = "60"
+
+[profile.release]
+opt-level = 2
