@@ -108,9 +108,12 @@ int n2p_writer_set_codec(N2PWriter* w, N2PCodec codec);
 
 #include <zstd.h>
 #include <nanoarrow/nanoarrow.h>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <nanom/formats/parquet_thrift.hpp>
+#include <nanom/tagged_encode.hpp>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -121,223 +124,13 @@ int n2p_writer_set_codec(N2PWriter* w, N2PCodec codec);
 
 // ---- src/parquet_types.hpp --------
 
-// Parquet format enums (values from parquet.thrift). Only the subset this writer
-// emits is defined here. These are the *logical* enum values stored as i32 fields
-// in the Thrift compact stream -- unrelated to the compact-protocol type nibbles
-// in thrift_compact.hpp.
-
-
-namespace n2p::pq {
-
-// Physical types (SchemaElement.type, ColumnMetaData.type).
-enum class Type : std::int32_t {
-    Boolean = 0,
-    Int32 = 1,
-    Int64 = 2,
-    Int96 = 3,
-    Float = 4,
-    Double = 5,
-    ByteArray = 6,
-    FixedLenByteArray = 7,
-};
-
-// Column / page encodings.
-enum class Encoding : std::int32_t {
-    Plain = 0,
-    PlainDictionary = 2,
-    Rle = 3,
-    BitPacked = 4,
-    RleDictionary = 8,
-};
-
-// Page compression codecs.
-enum class Codec : std::int32_t {
-    Uncompressed = 0,
-    Snappy = 1,
-    Gzip = 2,
-    Brotli = 4,
-    Lz4 = 5,
-    Zstd = 6,
-    Lz4Raw = 7,
-};
-
-enum class Repetition : std::int32_t {
-    Required = 0,
-    Optional = 1,
-    Repeated = 2,
-};
-
-// Legacy "ConvertedType" annotations -- widely read and simpler than the
-// LogicalType union; sufficient for unsigned ints, narrow ints, and UTF8 strings.
-enum class ConvertedType : std::int32_t {
-    Utf8 = 0,
-    Uint8 = 11,
-    Uint16 = 12,
-    Uint32 = 13,
-    Uint64 = 14,
-    Int8 = 15,
-    Int16 = 16,
-    Int32 = 17,
-    Int64 = 18,
-};
-
-enum class PageType : std::int32_t {
-    DataPage = 0,
-    IndexPage = 1,
-    DictionaryPage = 2,
-    DataPageV2 = 3,
-};
-
-}  // namespace n2p::pq
-
-// ---- src/thrift_compact.hpp --------
-
-// A tiny, write-only Thrift *compact protocol* encoder -- just enough to emit the
-// Parquet FileMetaData and PageHeader structures. No Thrift library, no decode.
-//
-// Compact protocol essentials (see the Thrift spec):
-//   * varint           : ULEB128, 7 bits/byte, low to high, 0x80 continuation bit.
-//   * zigzag           : map signed -> unsigned so small magnitudes stay small.
-//   * struct field hdr : if the field-id delta from the previous field is in
-//                        1..15, one byte (delta << 4) | type; otherwise a type
-//                        byte followed by the zigzag-varint i16 field id. Field
-//                        ids within a struct MUST be written in ascending order.
-//   * bool fields      : the value lives in the type nibble (TRUE=1 / FALSE=2).
-//   * STOP             : a single 0x00 byte ends every struct.
-//   * list header      : if size <= 14, one byte (size << 4) | elemType; else
-//                        0xF0 | elemType followed by the varint size.
+// The Parquet format model this writer emits is nanom's (nanom/formats/parquet_thrift.hpp): the
+// same structs and enums parquet2nanoarrow reads, encoded with nanom/tagged_encode.hpp. There is
+// no second copy of parquet.thrift here, so the reader and the writer cannot drift apart.
 
 
 namespace n2p {
-
-// Compact-protocol type ids (the wire nibble), distinct from Parquet's own enums.
-enum class CType : std::uint8_t {
-    BoolTrue = 1,
-    BoolFalse = 2,
-    Byte = 3,
-    I16 = 4,
-    I32 = 5,
-    I64 = 6,
-    Double = 7,
-    Binary = 8,  // also used for string
-    List = 9,
-    Set = 10,
-    Map = 11,
-    Struct = 12,
-};
-
-class CompactWriter {
-public:
-    explicit CompactWriter(std::vector<std::uint8_t>& out) : out_(out) {}
-
-    std::size_t size() const { return out_.size(); }
-
-    // ---- low-level value writers (no field header) ----
-
-    void put_byte(std::uint8_t b) { out_.push_back(b); }
-
-    void put_varint(std::uint64_t v) {
-        while (v >= 0x80) {
-            out_.push_back(static_cast<std::uint8_t>(v) | 0x80);
-            v >>= 7;
-        }
-        out_.push_back(static_cast<std::uint8_t>(v));
-    }
-
-    void put_zigzag_i32(std::int32_t v) {
-        put_varint(static_cast<std::uint32_t>((v << 1) ^ (v >> 31)));
-    }
-    void put_zigzag_i64(std::int64_t v) {
-        put_varint(static_cast<std::uint64_t>((v << 1) ^ (v >> 63)));
-    }
-
-    void put_binary(std::span<const std::uint8_t> bytes) {
-        put_varint(bytes.size());
-        out_.insert(out_.end(), bytes.begin(), bytes.end());
-    }
-    void put_string(std::string_view s) {
-        put_varint(s.size());
-        out_.insert(out_.end(), s.begin(), s.end());
-    }
-
-    // ---- field headers / typed fields ----
-
-    void field_header(CType type, std::int16_t id) {
-        const int delta = id - last_id_;
-        if (delta > 0 && delta <= 15) {
-            out_.push_back(static_cast<std::uint8_t>((delta << 4) |
-                                                     static_cast<std::uint8_t>(type)));
-        } else {
-            out_.push_back(static_cast<std::uint8_t>(type));
-            put_zigzag_i32(id);  // i16 zigzag fits in the i32 path
-        }
-        last_id_ = id;
-    }
-
-    void field_bool(std::int16_t id, bool value) {
-        field_header(value ? CType::BoolTrue : CType::BoolFalse, id);
-    }
-    void field_i32(std::int16_t id, std::int32_t v) {
-        field_header(CType::I32, id);
-        put_zigzag_i32(v);
-    }
-    void field_i64(std::int16_t id, std::int64_t v) {
-        field_header(CType::I64, id);
-        put_zigzag_i64(v);
-    }
-    void field_string(std::int16_t id, std::string_view s) {
-        field_header(CType::Binary, id);
-        put_string(s);
-    }
-    void field_binary(std::int16_t id, std::span<const std::uint8_t> bytes) {
-        field_header(CType::Binary, id);
-        put_binary(bytes);
-    }
-
-    // List field: writes the field + list header. Caller then writes `size`
-    // element values (for struct elements use begin_struct_element/end_struct).
-    void field_list_header(std::int16_t id, CType elem, std::size_t size) {
-        field_header(CType::List, id);
-        list_header(elem, size);
-    }
-
-    void list_header(CType elem, std::size_t size) {
-        if (size <= 14) {
-            out_.push_back(static_cast<std::uint8_t>((size << 4) |
-                                                     static_cast<std::uint8_t>(elem)));
-        } else {
-            out_.push_back(static_cast<std::uint8_t>(0xF0) |
-                           static_cast<std::uint8_t>(elem));
-            put_varint(size);
-        }
-    }
-
-    // Begin a struct as a *field* of the current struct.
-    void begin_struct_field(std::int16_t id) {
-        field_header(CType::Struct, id);
-        push_struct();
-    }
-    // Begin a struct that is an *element of a list* (no preceding field header).
-    void begin_struct_element() { push_struct(); }
-
-    // End the current struct: STOP byte, restore parent's last-id.
-    void end_struct() {
-        out_.push_back(0x00);
-        last_id_ = id_stack_.back();
-        id_stack_.pop_back();
-    }
-
-private:
-    void push_struct() {
-        id_stack_.push_back(last_id_);
-        last_id_ = 0;
-    }
-
-    std::vector<std::uint8_t>& out_;
-    std::vector<std::int16_t> id_stack_;
-    std::int16_t last_id_ = 0;
-};
-
+namespace pq = nanom_formats::parquet;
 }  // namespace n2p
 
 // ---- src/rle_bitpack.hpp --------
@@ -426,7 +219,9 @@ inline std::vector<std::uint8_t> encode_rle_dictionary_indices(
 inline std::vector<std::uint8_t> encode_definition_levels(
     std::span<const std::uint32_t> levels, int bit_width) {
     const std::vector<std::uint8_t> run = encode_rle_dictionary_indices(levels, bit_width);
+    if (run.size() > UINT32_MAX) throw std::length_error("definition levels larger than 4 GiB");
     std::vector<std::uint8_t> out;
+    out.reserve(4 + run.size());
     const std::uint32_t len = static_cast<std::uint32_t>(run.size());
     out.push_back(len & 0xFF);
     out.push_back((len >> 8) & 0xFF);
@@ -454,12 +249,12 @@ namespace n2p {
 // UNCOMPRESSED, returns a copy of the input. Throws std::runtime_error on a codec
 // failure (callers translate to N2P_IO_ERROR).
 inline std::vector<std::uint8_t> compress_page(std::span<const std::uint8_t> src,
-                                               pq::Codec codec,
+                                               pq::CompressionCodec codec,
                                                int level = 3) {
-    if (codec == pq::Codec::Uncompressed) {
+    if (codec == pq::CompressionCodec::UNCOMPRESSED) {
         return std::vector<std::uint8_t>(src.begin(), src.end());
     }
-    // pq::Codec::Zstd
+    // pq::CompressionCodec::ZSTD
     const std::size_t bound = ZSTD_compressBound(src.size());
     std::vector<std::uint8_t> dst(bound);
     const std::size_t n = ZSTD_compress(dst.data(), dst.size(),
@@ -515,7 +310,7 @@ std::optional<ColumnSpec> map_format(const char* format, std::string name,
     s.name = std::move(name);
     s.nullable = nullable;
     if (std::strcmp(format, "n") == 0) {  // null type: every value is null
-        s.type = pq::Type::Int32;
+        s.type = pq::Type::INT32;
         s.extract = Extract::Null;
         s.nullable = true;  // an all-null column is inherently OPTIONAL
         return s;
@@ -526,57 +321,57 @@ std::optional<ColumnSpec> map_format(const char* format, std::string name,
         s.src_width = width;
     };
     if (std::strcmp(format, "b") == 0) {
-        s.type = pq::Type::Boolean;
+        s.type = pq::Type::BOOLEAN;
         s.extract = Extract::Bool;
         return s;
     }
     if (std::strcmp(format, "c") == 0) {  // int8
-        s.type = pq::Type::Int32; s.extract = Extract::WidenInt; s.src_width = 1;
-        s.sign_extend = true; s.has_converted = true; s.converted = pq::ConvertedType::Int8;
+        s.type = pq::Type::INT32; s.extract = Extract::WidenInt; s.src_width = 1;
+        s.sign_extend = true; s.has_converted = true; s.converted = pq::ConvertedType::INT_8;
         return s;
     }
     if (std::strcmp(format, "C") == 0) {  // uint8
-        s.type = pq::Type::Int32; s.extract = Extract::WidenInt; s.src_width = 1;
-        s.has_converted = true; s.converted = pq::ConvertedType::Uint8;
+        s.type = pq::Type::INT32; s.extract = Extract::WidenInt; s.src_width = 1;
+        s.has_converted = true; s.converted = pq::ConvertedType::UINT_8;
         return s;
     }
     if (std::strcmp(format, "s") == 0) {  // int16
-        s.type = pq::Type::Int32; s.extract = Extract::WidenInt; s.src_width = 2;
-        s.sign_extend = true; s.has_converted = true; s.converted = pq::ConvertedType::Int16;
+        s.type = pq::Type::INT32; s.extract = Extract::WidenInt; s.src_width = 2;
+        s.sign_extend = true; s.has_converted = true; s.converted = pq::ConvertedType::INT_16;
         return s;
     }
     if (std::strcmp(format, "S") == 0) {  // uint16
-        s.type = pq::Type::Int32; s.extract = Extract::WidenInt; s.src_width = 2;
-        s.has_converted = true; s.converted = pq::ConvertedType::Uint16;
+        s.type = pq::Type::INT32; s.extract = Extract::WidenInt; s.src_width = 2;
+        s.has_converted = true; s.converted = pq::ConvertedType::UINT_16;
         return s;
     }
-    if (std::strcmp(format, "i") == 0) { fixed(pq::Type::Int32, 4); return s; }
+    if (std::strcmp(format, "i") == 0) { fixed(pq::Type::INT32, 4); return s; }
     if (std::strcmp(format, "I") == 0) {  // uint32
-        fixed(pq::Type::Int32, 4);
-        s.has_converted = true; s.converted = pq::ConvertedType::Uint32; return s;
+        fixed(pq::Type::INT32, 4);
+        s.has_converted = true; s.converted = pq::ConvertedType::UINT_32; return s;
     }
-    if (std::strcmp(format, "l") == 0) { fixed(pq::Type::Int64, 8); return s; }
+    if (std::strcmp(format, "l") == 0) { fixed(pq::Type::INT64, 8); return s; }
     if (std::strcmp(format, "L") == 0) {  // uint64
-        fixed(pq::Type::Int64, 8);
-        s.has_converted = true; s.converted = pq::ConvertedType::Uint64; return s;
+        fixed(pq::Type::INT64, 8);
+        s.has_converted = true; s.converted = pq::ConvertedType::UINT_64; return s;
     }
-    if (std::strcmp(format, "f") == 0) { fixed(pq::Type::Float, 4); return s; }
-    if (std::strcmp(format, "g") == 0) { fixed(pq::Type::Double, 8); return s; }
+    if (std::strcmp(format, "f") == 0) { fixed(pq::Type::FLOAT, 4); return s; }
+    if (std::strcmp(format, "g") == 0) { fixed(pq::Type::DOUBLE, 8); return s; }
     if (std::strncmp(format, "w:", 2) == 0) {  // fixed_size_binary:N
         const int n = std::atoi(format + 2);
         if (n <= 0) { err = "invalid fixed_size_binary width: " + std::string(format); return std::nullopt; }
-        s.type = pq::Type::FixedLenByteArray; s.extract = Extract::MemcpyFixed;
+        s.type = pq::Type::FIXED_LEN_BYTE_ARRAY; s.extract = Extract::MemcpyFixed;
         s.src_width = n; s.type_length = n;
         return s;
     }
     if (std::strcmp(format, "u") == 0 || std::strcmp(format, "U") == 0) {  // utf8 / large_utf8
-        s.type = pq::Type::ByteArray; s.extract = Extract::ByteArray;
-        s.has_converted = true; s.converted = pq::ConvertedType::Utf8;
+        s.type = pq::Type::BYTE_ARRAY; s.extract = Extract::ByteArray;
+        s.has_converted = true; s.converted = pq::ConvertedType::UTF8;
         s.large_offsets = (format[0] == 'U');
         return s;
     }
     if (std::strcmp(format, "z") == 0 || std::strcmp(format, "Z") == 0) {  // binary / large_binary
-        s.type = pq::Type::ByteArray; s.extract = Extract::ByteArray;
+        s.type = pq::Type::BYTE_ARRAY; s.extract = Extract::ByteArray;
         s.large_offsets = (format[0] == 'Z');
         return s;
     }
@@ -841,43 +636,61 @@ ByteArrayPages build_byte_array_pages(const ArrowArray& arr, const ColumnSpec& s
 }
 
 // ---- page header serialization -------------------------------------------
+//
+// Page headers are nanom_formats::parquet::PageHeader values (the model parquet2nanoarrow reads),
+// encoded by nanom into a stack buffer: no allocation per page, and a header that does not fit or
+// a size beyond the wire's i32 is an error instead of a silently truncated field.
 
-std::vector<std::uint8_t> data_page_header(std::int32_t num_values,
-                                           pq::Encoding encoding,
-                                           std::int32_t uncompressed,
-                                           std::int32_t compressed) {
-    std::vector<std::uint8_t> buf;
-    CompactWriter w(buf);
-    w.begin_struct_element();
-    w.field_i32(1, static_cast<std::int32_t>(pq::PageType::DataPage));
-    w.field_i32(2, uncompressed);
-    w.field_i32(3, compressed);
-    w.begin_struct_field(5);  // DataPageHeader
-    w.field_i32(1, num_values);
-    w.field_i32(2, static_cast<std::int32_t>(encoding));
-    w.field_i32(3, static_cast<std::int32_t>(pq::Encoding::Rle));  // def levels
-    w.field_i32(4, static_cast<std::int32_t>(pq::Encoding::Rle));  // rep levels
-    w.end_struct();
-    w.end_struct();
-    return buf;
+struct HeaderBytes {
+    std::array<std::byte, 128> buf;  // a data / dictionary page header is < 40 bytes
+    std::size_t size = 0;
+    std::span<const std::uint8_t> bytes() const {
+        return {reinterpret_cast<const std::uint8_t*>(buf.data()), size};
+    }
+};
+
+std::int32_t page_size_i32(std::size_t n) {
+    if (n > static_cast<std::size_t>(INT32_MAX))
+        throw std::length_error("a page larger than 2 GiB (Parquet page sizes are i32)");
+    return static_cast<std::int32_t>(n);
 }
 
-std::vector<std::uint8_t> dictionary_page_header(std::int32_t num_values,
-                                                 std::int32_t uncompressed,
-                                                 std::int32_t compressed) {
-    std::vector<std::uint8_t> buf;
-    CompactWriter w(buf);
-    w.begin_struct_element();
-    w.field_i32(1, static_cast<std::int32_t>(pq::PageType::DictionaryPage));
-    w.field_i32(2, uncompressed);
-    w.field_i32(3, compressed);
-    w.begin_struct_field(7);  // DictionaryPageHeader
-    w.field_i32(1, num_values);
-    w.field_i32(2, static_cast<std::int32_t>(pq::Encoding::Plain));
-    w.field_bool(3, false);  // is_sorted
-    w.end_struct();
-    w.end_struct();
-    return buf;
+HeaderBytes encode_page_header(const pq::PageHeader& h) {
+    HeaderBytes out;
+    nanom::span_sink sink{out.buf};
+    auto r = nanom::thrift_compact_encode(h, sink);
+    if (!r) throw std::runtime_error(std::string("page header encoding failed: ") + r.error().what);
+    out.size = *r;
+    return out;
+}
+
+HeaderBytes data_page_header(std::size_t num_values, pq::Encoding encoding,
+                             std::size_t uncompressed, std::size_t compressed) {
+    pq::DataPageHeader d;
+    d.num_values = page_size_i32(num_values);
+    d.encoding = encoding;
+    d.definition_level_encoding = pq::Encoding::RLE;
+    d.repetition_level_encoding = pq::Encoding::RLE;
+    pq::PageHeader h;
+    h.type = pq::PageType::DATA_PAGE;
+    h.uncompressed_page_size = page_size_i32(uncompressed);
+    h.compressed_page_size = page_size_i32(compressed);
+    h.data_page_header = d;
+    return encode_page_header(h);
+}
+
+HeaderBytes dictionary_page_header(std::size_t num_values, std::size_t uncompressed,
+                                   std::size_t compressed) {
+    pq::DictionaryPageHeader d;
+    d.num_values = page_size_i32(num_values);
+    d.encoding = pq::Encoding::PLAIN;
+    d.is_sorted = false;
+    pq::PageHeader h;
+    h.type = pq::PageType::DICTIONARY_PAGE;
+    h.uncompressed_page_size = page_size_i32(uncompressed);
+    h.compressed_page_size = page_size_i32(compressed);
+    h.dictionary_page_header = d;
+    return encode_page_header(h);
 }
 
 }  // namespace
@@ -889,7 +702,7 @@ struct N2PWriter {
     std::ofstream out;
     std::string path;
     std::int64_t offset = 0;
-    n2p::pq::Codec codec = n2p::pq::Codec::Zstd;
+    n2p::pq::CompressionCodec codec = n2p::pq::CompressionCodec::ZSTD;
     bool schema_locked = false;
     std::vector<n2p::SchemaNode> schema_nodes;  // pre-order, for the footer schema
     std::vector<n2p::LeafSpec> leaves;          // one column chunk per leaf
@@ -916,9 +729,10 @@ void write_bytes(N2PWriter& w, std::span<const std::uint8_t> bytes) {
 // matching ColumnMetaData's total_*_size semantics.
 struct PageBytes { std::int64_t on_disk; std::int64_t uncompressed; };
 
-PageBytes emit_page(N2PWriter& w, const std::vector<std::uint8_t>& header,
+PageBytes emit_page(N2PWriter& w, const HeaderBytes& hdr,
                     const std::vector<std::uint8_t>& compressed_body,
                     std::size_t uncompressed_body) {
+    const auto header = hdr.bytes();
     write_bytes(w, header);
     write_bytes(w, compressed_body);
     return {static_cast<std::int64_t>(header.size() + compressed_body.size()),
@@ -949,85 +763,85 @@ bool validate_child(const ArrowArray& child, const ColumnSpec& s,
     return true;
 }
 
-void serialize_schema_element(CompactWriter& w, const SchemaNode& s) {
-    w.begin_struct_element();
-    const auto rep = static_cast<std::int32_t>(s.optional ? pq::Repetition::Optional
-                                                          : pq::Repetition::Required);
+// The footer: a pq::FileMetaData built from the writer's state and encoded by nanom. Strings are
+// views into the writer's schema / chunk records; lists are list<E>::of views over the vectors
+// below, which own the elements until encoding is done. Nothing is copied twice.
+pq::SchemaElement schema_element(const SchemaNode& s) {
+    pq::SchemaElement e;
+    e.repetition_type = s.optional ? pq::FieldRepetitionType::OPTIONAL
+                                   : pq::FieldRepetitionType::REQUIRED;
+    e.name = std::string_view(s.name);
     if (s.is_group) {
         // A group (struct) has no physical type; it declares num_children.
-        w.field_i32(3, rep);
-        w.field_string(4, s.name);
-        w.field_i32(5, s.num_children);
+        e.num_children = s.num_children;
     } else {
-        w.field_i32(1, static_cast<std::int32_t>(s.type));
-        if (s.type == pq::Type::FixedLenByteArray) {
-            w.field_i32(2, s.type_length);
-        }
-        w.field_i32(3, rep);
-        w.field_string(4, s.name);
-        if (s.has_converted) {
-            w.field_i32(6, static_cast<std::int32_t>(s.converted));
-        }
+        e.type = s.type;
+        if (s.type == pq::Type::FIXED_LEN_BYTE_ARRAY) e.type_length = s.type_length;
+        if (s.has_converted) e.converted_type = s.converted;
     }
-    w.end_struct();
+    return e;
 }
 
-void serialize_column_chunk(CompactWriter& w, const ColumnChunkMeta& c, pq::Codec codec) {
-    w.begin_struct_element();
-    w.field_i64(2, c.file_offset);
-    w.begin_struct_field(3);  // ColumnMetaData
-    w.field_i32(1, static_cast<std::int32_t>(c.type));
-    w.field_list_header(2, CType::I32, c.encodings.size());
-    for (auto e : c.encodings) {
-        w.put_zigzag_i32(static_cast<std::int32_t>(e));
-    }
-    w.field_list_header(3, CType::Binary, c.path.size());
-    for (const auto& p : c.path) {
-        w.put_string(p);
-    }
-    w.field_i32(4, static_cast<std::int32_t>(codec));
-    w.field_i64(5, c.num_values);
-    w.field_i64(6, c.total_uncompressed);
-    w.field_i64(7, c.total_compressed);
-    w.field_i64(9, c.data_page_offset);
-    if (c.has_dictionary) {
-        w.field_i64(11, c.dictionary_page_offset);
-    }
-    w.end_struct();
-    w.end_struct();
-}
-
-std::vector<std::uint8_t> serialize_footer(const N2PWriter& w) {
-    std::vector<std::uint8_t> buf;
-    CompactWriter cw(buf);
-    cw.begin_struct_element();  // FileMetaData
-    cw.field_i32(1, 1);          // version
-    cw.field_list_header(2, CType::Struct, w.schema_nodes.size() + 1);
+bool serialize_footer(const N2PWriter& w, std::vector<std::byte>& out, std::string& err) {
+    std::vector<pq::SchemaElement> schema;
+    schema.reserve(w.schema_nodes.size() + 1);
     {
         // root schema element: name + num_children only (no type/repetition).
-        cw.begin_struct_element();
-        cw.field_string(4, "schema");
-        cw.field_i32(5, w.top_children);
-        cw.end_struct();
+        pq::SchemaElement root;
+        root.name = std::string_view("schema");
+        root.num_children = w.top_children;
+        schema.push_back(root);
     }
-    for (const auto& s : w.schema_nodes) {
-        serialize_schema_element(cw, s);
-    }
-    cw.field_i64(3, w.total_rows);
-    cw.field_list_header(4, CType::Struct, w.row_groups.size());
+    for (const auto& s : w.schema_nodes) schema.push_back(schema_element(s));
+
+    std::size_t n_chunks = 0;
+    for (const auto& rg : w.row_groups) n_chunks += rg.columns.size();
+    std::vector<std::vector<std::string_view>> paths;  // path_in_schema per chunk
+    std::vector<std::vector<pq::ColumnChunk>> chunks;  // columns per row group
+    std::vector<pq::RowGroup> row_groups;
+    paths.reserve(n_chunks);
+    chunks.reserve(w.row_groups.size());
+    row_groups.reserve(w.row_groups.size());
     for (const auto& rg : w.row_groups) {
-        cw.begin_struct_element();
-        cw.field_list_header(1, CType::Struct, rg.columns.size());
+        auto& cols = chunks.emplace_back();
+        cols.reserve(rg.columns.size());
         for (const auto& c : rg.columns) {
-            serialize_column_chunk(cw, c, w.codec);
+            auto& path = paths.emplace_back(c.path.begin(), c.path.end());
+            pq::ColumnMetaData m;
+            m.type = c.type;
+            m.encodings = nanom::list<pq::Encoding>::of(c.encodings);
+            m.path_in_schema = nanom::list<std::string_view>::of(path);
+            m.codec = w.codec;
+            m.num_values = c.num_values;
+            m.total_uncompressed_size = c.total_uncompressed;
+            m.total_compressed_size = c.total_compressed;
+            m.data_page_offset = c.data_page_offset;
+            if (c.has_dictionary) m.dictionary_page_offset = c.dictionary_page_offset;
+            pq::ColumnChunk cc;
+            cc.file_offset = c.file_offset;
+            cc.meta_data = m;
+            cols.push_back(cc);
         }
-        cw.field_i64(2, rg.total_byte_size);
-        cw.field_i64(3, rg.num_rows);
-        cw.end_struct();
+        pq::RowGroup g;
+        g.columns = nanom::list<pq::ColumnChunk>::of(cols);
+        g.total_byte_size = rg.total_byte_size;
+        g.num_rows = rg.num_rows;
+        row_groups.push_back(g);
     }
-    cw.field_string(6, "nanoarrow2parquet");
-    cw.end_struct();
-    return buf;
+
+    pq::FileMetaData f;
+    f.version = 1;
+    f.schema = nanom::list<pq::SchemaElement>::of(schema);
+    f.num_rows = w.total_rows;
+    f.row_groups = nanom::list<pq::RowGroup>::of(row_groups);
+    f.created_by = std::string_view("nanoarrow2parquet");
+    auto r = nanom::thrift_compact_encode(f, out);
+    if (!r) {
+        err = std::string("footer encoding failed: ") + r.error().what + " (in " +
+              std::string(r.error().message) + "." + std::string(r.error().field) + ")";
+        return false;
+    }
+    return true;
 }
 
 int write_one_batch(N2PWriter& w, const ArrowSchema* schema, const ArrowArray* batch) {
@@ -1151,9 +965,7 @@ int write_one_batch(N2PWriter& w, const ArrowSchema* schema, const ArrowArray* b
                     // dictionary page
                     auto dict_comp = compress_page(pages.dict_body, w.codec);
                     auto dict_hdr = dictionary_page_header(
-                        static_cast<std::int32_t>(pages.dict_size),
-                        static_cast<std::int32_t>(pages.dict_body.size()),
-                        static_cast<std::int32_t>(dict_comp.size()));
+                        pages.dict_size, pages.dict_body.size(), dict_comp.size());
                     c.dictionary_page_offset = w.offset;
                     c.has_dictionary = true;
                     PageBytes dp = emit_page(w, dict_hdr, dict_comp, pages.dict_body.size());
@@ -1162,28 +974,26 @@ int write_one_batch(N2PWriter& w, const ArrowSchema* schema, const ArrowArray* b
                     data_body.insert(data_body.end(), pages.data_body.begin(), pages.data_body.end());
                     auto data_comp = compress_page(data_body, w.codec);
                     auto data_hdr = data_page_header(
-                        static_cast<std::int32_t>(batch->length), pq::Encoding::RleDictionary,
-                        static_cast<std::int32_t>(data_body.size()),
-                        static_cast<std::int32_t>(data_comp.size()));
+                        static_cast<std::size_t>(batch->length), pq::Encoding::RLE_DICTIONARY,
+                        data_body.size(), data_comp.size());
                     c.data_page_offset = w.offset;
                     PageBytes vp = emit_page(w, data_hdr, data_comp, data_body.size());
                     c.total_uncompressed = dp.uncompressed + vp.uncompressed;
                     c.total_compressed = dp.on_disk + vp.on_disk;
-                    c.encodings = {pq::Encoding::Plain, pq::Encoding::RleDictionary};
+                    c.encodings = {pq::Encoding::PLAIN, pq::Encoding::RLE_DICTIONARY};
                 } else {
                     // PLAIN BYTE_ARRAY data page, def levels first.
                     std::vector<std::uint8_t> data_body = def_prefix;
                     data_body.insert(data_body.end(), pages.data_body.begin(), pages.data_body.end());
                     auto data_comp = compress_page(data_body, w.codec);
                     auto data_hdr = data_page_header(
-                        static_cast<std::int32_t>(batch->length), pq::Encoding::Plain,
-                        static_cast<std::int32_t>(data_body.size()),
-                        static_cast<std::int32_t>(data_comp.size()));
+                        static_cast<std::size_t>(batch->length), pq::Encoding::PLAIN,
+                        data_body.size(), data_comp.size());
                     c.data_page_offset = w.offset;
                     PageBytes vp = emit_page(w, data_hdr, data_comp, data_body.size());
                     c.total_uncompressed = vp.uncompressed;
                     c.total_compressed = vp.on_disk;
-                    c.encodings = {pq::Encoding::Plain};
+                    c.encodings = {pq::Encoding::PLAIN};
                 }
             } else {
                 std::vector<std::uint8_t> body = def_prefix;
@@ -1196,14 +1006,13 @@ int write_one_batch(N2PWriter& w, const ArrowSchema* schema, const ArrowArray* b
                 }
                 auto comp = compress_page(body, w.codec);
                 auto hdr = data_page_header(
-                    static_cast<std::int32_t>(batch->length), pq::Encoding::Plain,
-                    static_cast<std::int32_t>(body.size()),
-                    static_cast<std::int32_t>(comp.size()));
+                    static_cast<std::size_t>(batch->length), pq::Encoding::PLAIN,
+                    body.size(), comp.size());
                 c.data_page_offset = w.offset;
                 PageBytes vp = emit_page(w, hdr, comp, body.size());
                 c.total_uncompressed = vp.uncompressed;
                 c.total_compressed = vp.on_disk;
-                c.encodings = {pq::Encoding::Plain};
+                c.encodings = {pq::Encoding::PLAIN};
             }
 
             rg.total_byte_size += c.total_uncompressed;
@@ -1253,8 +1062,8 @@ int n2p_writer_set_codec(N2PWriter* w, N2PCodec codec) {
         return N2P_INVALID_ARGUMENT;
     }
     switch (codec) {
-        case N2P_CODEC_ZSTD: w->codec = n2p::pq::Codec::Zstd; return N2P_OK;
-        case N2P_CODEC_UNCOMPRESSED: w->codec = n2p::pq::Codec::Uncompressed; return N2P_OK;
+        case N2P_CODEC_ZSTD: w->codec = n2p::pq::CompressionCodec::ZSTD; return N2P_OK;
+        case N2P_CODEC_UNCOMPRESSED: w->codec = n2p::pq::CompressionCodec::UNCOMPRESSED; return N2P_OK;
     }
     w->last_error = "unknown codec";
     return N2P_INVALID_ARGUMENT;
@@ -1278,16 +1087,24 @@ int n2p_writer_close(N2PWriter* w) {
     }
     int status = N2P_OK;
     if (w->out.is_open() && !w->footer_written) {
-        std::vector<std::uint8_t> footer = n2p::serialize_footer(*w);
-        n2p::write_bytes(*w, footer);
-        std::uint32_t len = static_cast<std::uint32_t>(footer.size());
-        std::uint8_t le[4] = {static_cast<std::uint8_t>(len & 0xFF),
-                              static_cast<std::uint8_t>((len >> 8) & 0xFF),
-                              static_cast<std::uint8_t>((len >> 16) & 0xFF),
-                              static_cast<std::uint8_t>((len >> 24) & 0xFF)};
-        n2p::write_bytes(*w, std::span<const std::uint8_t>(le, 4));
-        n2p::write_bytes(*w, std::span<const std::uint8_t>(
-                                 reinterpret_cast<const std::uint8_t*>(n2p::kMagic), 4));
+        std::vector<std::byte> footer;
+        std::string err;
+        if (!n2p::serialize_footer(*w, footer, err) || footer.size() > UINT32_MAX) {
+            // the file is left without a footer: unreadable, never wrong
+            w->last_error = err.empty() ? "footer larger than 4 GiB" : err;
+            status = N2P_IO_ERROR;
+        } else {
+            n2p::write_bytes(*w, std::span<const std::uint8_t>(
+                                     reinterpret_cast<const std::uint8_t*>(footer.data()), footer.size()));
+            std::uint32_t len = static_cast<std::uint32_t>(footer.size());
+            std::uint8_t le[4] = {static_cast<std::uint8_t>(len & 0xFF),
+                                  static_cast<std::uint8_t>((len >> 8) & 0xFF),
+                                  static_cast<std::uint8_t>((len >> 16) & 0xFF),
+                                  static_cast<std::uint8_t>((len >> 24) & 0xFF)};
+            n2p::write_bytes(*w, std::span<const std::uint8_t>(le, 4));
+            n2p::write_bytes(*w, std::span<const std::uint8_t>(
+                                     reinterpret_cast<const std::uint8_t*>(n2p::kMagic), 4));
+        }
         w->footer_written = true;
         w->out.flush();
         if (!w->out.good()) {

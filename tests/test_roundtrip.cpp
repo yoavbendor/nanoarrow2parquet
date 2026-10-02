@@ -1,18 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
-// Unit-level checks for nanoarrow2parquet. The end-to-end oracle (does pyarrow
-// read back the exact values?) lives in tests/smoke_pyarrow_roundtrip.sh; here we
-// exercise the low-level encoders and the file framing directly in C++.
+// Unit-level checks for nanoarrow2parquet. The end-to-end oracles (do pyarrow, arrow-rs and
+// parquet2nanoarrow read back the exact values?) live in tests/oracle_roundtrip.py and
+// tests/smoke_pyarrow_roundtrip.sh; here we exercise the low-level encoders and the file framing
+// directly in C++. The Thrift metadata is nanom's (its encoder is tested in nanom); here every
+// written footer and page header is decoded back through the same nanom model.
 
 #include "nanoarrow2parquet/nanoarrow2parquet.h"
 
 #include "rle_bitpack.hpp"
-#include "thrift_compact.hpp"
+#include "parquet_types.hpp"
 
 #include <nanoarrow/nanoarrow.h>
 
 #include <cstdint>
+#include <span>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -28,64 +31,6 @@ void require(bool cond, const char* msg) {
         std::fprintf(stderr, "FAIL: %s\n", msg);
         ++g_failures;
     }
-}
-
-// Decode a ULEB128 varint to validate the compact-protocol primitives.
-std::uint64_t read_varint(const std::vector<std::uint8_t>& b, std::size_t& pos) {
-    std::uint64_t v = 0;
-    int shift = 0;
-    while (true) {
-        std::uint8_t byte = b[pos++];
-        v |= static_cast<std::uint64_t>(byte & 0x7F) << shift;
-        if ((byte & 0x80) == 0) break;
-        shift += 7;
-    }
-    return v;
-}
-
-void test_varint() {
-    std::vector<std::uint8_t> buf;
-    n2p::CompactWriter w(buf);
-    w.put_varint(0);
-    w.put_varint(1);
-    w.put_varint(127);
-    w.put_varint(128);
-    w.put_varint(300);
-    w.put_varint(16384);
-    std::size_t pos = 0;
-    require(read_varint(buf, pos) == 0, "varint 0");
-    require(read_varint(buf, pos) == 1, "varint 1");
-    require(read_varint(buf, pos) == 127, "varint 127");
-    require(read_varint(buf, pos) == 128, "varint 128");
-    require(read_varint(buf, pos) == 300, "varint 300");
-    require(read_varint(buf, pos) == 16384, "varint 16384");
-    require(pos == buf.size(), "varint stream fully consumed");
-}
-
-void test_zigzag() {
-    std::vector<std::uint8_t> buf;
-    n2p::CompactWriter w(buf);
-    // zigzag mapping: 0->0, -1->1, 1->2, -2->3, 2->4
-    w.put_zigzag_i32(0);
-    w.put_zigzag_i32(-1);
-    w.put_zigzag_i32(1);
-    w.put_zigzag_i32(-2);
-    w.put_zigzag_i32(2);
-    const std::vector<std::uint8_t> expected = {0, 1, 2, 3, 4};
-    require(buf == expected, "zigzag i32 mapping");
-}
-
-void test_field_delta() {
-    // Two consecutive small fields should use the single-byte delta form.
-    std::vector<std::uint8_t> buf;
-    n2p::CompactWriter w(buf);
-    w.field_i32(1, 5);  // header byte (delta=1, type I32=5) then zigzag(5)=10
-    w.field_i32(2, 7);  // header byte (delta=1, type I32=5) then zigzag(7)=14
-    require(buf.size() == 4, "delta-encoded field headers are one byte each");
-    require(buf[0] == ((1 << 4) | 5), "field 1 header nibble");
-    require(buf[1] == 10, "field 1 value zigzag");
-    require(buf[2] == ((1 << 4) | 5), "field 2 header nibble");
-    require(buf[3] == 14, "field 2 value zigzag");
 }
 
 void test_bit_width() {
@@ -159,6 +104,41 @@ void test_write_framing() {
                          (static_cast<std::uint8_t>(bytes[n - 6]) << 16) |
                          (static_cast<std::uint32_t>(static_cast<std::uint8_t>(bytes[n - 5])) << 24);
     require(flen > 0 && flen < n, "footer length is in range");
+
+    // The footer and every page header decode through nanom's model (what readers use), and they
+    // say what was written: 3 rows, schema root + 2 leaves, and page sizes that tile each chunk.
+    namespace pq = n2p::pq;
+    const auto file = std::span<const std::byte>(reinterpret_cast<const std::byte*>(bytes.data()), n);
+    auto md = pq::read_file_metadata(nanom::from(file));
+    require(md.has_value(), "footer decodes through nanom");
+    if (md) {
+        const pq::FileMetaData& m = md->value;
+        require(*m.num_rows == 3 && m.schema->size() == 3 && m.row_groups->size() == 1, "footer contents");
+        require(m.created_by->has_value() && **m.created_by == "nanoarrow2parquet", "created_by");
+        auto rg = m.row_groups->at(0);
+        require(rg && *rg->num_rows == 3 && rg->columns->size() == 2, "row group contents");
+        if (rg) {
+            (void)rg->columns->for_each([&](const pq::ColumnChunk& cc) {
+                const auto& c = **cc.meta_data;
+                // walk the chunk's pages: headers decode, sizes add up to the chunk's total
+                std::int64_t at = c.dictionary_page_offset->value_or(*c.data_page_offset);
+                const std::int64_t end = at + *c.total_compressed_size;
+                std::int64_t values = 0;
+                while (at < end) {
+                    auto ph = nanom::thrift_compact<pq::PageHeader>()(
+                        nanom::from(file.subspan(static_cast<std::size_t>(at))));
+                    require(ph.has_value(), "page header decodes through nanom");
+                    if (!ph) return;
+                    const auto hdr_len = static_cast<std::int64_t>(ph->rest.first - (file.data() + at));
+                    if (ph->value.data_page_header->has_value())
+                        values += *(**ph->value.data_page_header).num_values;
+                    at += hdr_len + *ph->value.compressed_page_size;
+                }
+                require(at == end, "pages tile the column chunk exactly");
+                require(values == *c.num_values, "data pages hold the chunk's values");
+            });
+        }
+    }
     std::remove(path.c_str());
 }
 
@@ -202,9 +182,6 @@ void test_null_handling() {
 }  // namespace
 
 int main() {
-    test_varint();
-    test_zigzag();
-    test_field_delta();
     test_bit_width();
     test_bit_pack();
     test_write_framing();

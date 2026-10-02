@@ -18,6 +18,7 @@
 // of the gap anyway.
 
 #include <cstdint>
+#include <stdexcept>
 #include <span>
 #include <vector>
 
@@ -90,7 +91,9 @@ inline std::vector<std::uint8_t> encode_rle_dictionary_indices(
 inline std::vector<std::uint8_t> encode_definition_levels(
     std::span<const std::uint32_t> levels, int bit_width) {
     const std::vector<std::uint8_t> run = encode_rle_dictionary_indices(levels, bit_width);
+    if (run.size() > UINT32_MAX) throw std::length_error("definition levels larger than 4 GiB");
     std::vector<std::uint8_t> out;
+    out.reserve(4 + run.size());
     const std::uint32_t len = static_cast<std::uint32_t>(run.size());
     out.push_back(len & 0xFF);
     out.push_back((len >> 8) & 0xFF);

@@ -29,7 +29,6 @@ PUBLIC_HEADER = ROOT / "include" / "nanoarrow2parquet" / "nanoarrow2parquet.h"
 # come last.
 IMPL_FILES = [
     ROOT / "src" / "parquet_types.hpp",
-    ROOT / "src" / "thrift_compact.hpp",
     ROOT / "src" / "rle_bitpack.hpp",
     ROOT / "src" / "compress.hpp",
     ROOT / "src" / "writer.cpp",
