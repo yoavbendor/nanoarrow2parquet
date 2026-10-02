@@ -49,6 +49,22 @@ typedef enum N2PCodec {
     N2P_CODEC_UNCOMPRESSED = 1
 } N2PCodec;
 
+// Page encodings for subsequent batches (default AUTO). Every mode is read by pyarrow, arrow-rs and
+// parquet2nanoarrow (tests/oracle_roundtrip.py checks each one).
+//   AUTO              strings: dictionary (RLE_DICTIONARY) when it is smaller, else PLAIN;
+//                     everything else PLAIN
+//   PLAIN             PLAIN everywhere (no dictionary)
+//   DELTA             DELTA_BINARY_PACKED for integer columns, DELTA_BYTE_ARRAY (front coding)
+//                     for strings / binary; others as AUTO. Best for sorted or slowly changing data.
+//   BYTE_STREAM_SPLIT BYTE_STREAM_SPLIT for float / double columns (better compression for
+//                     floating point); others as AUTO.
+typedef enum N2PEncoding {
+    N2P_ENCODING_AUTO = 0,
+    N2P_ENCODING_PLAIN = 1,
+    N2P_ENCODING_DELTA = 2,
+    N2P_ENCODING_BYTE_STREAM_SPLIT = 3
+} N2PEncoding;
+
 // One-shot: schema + one record batch -> one .parquet file (single row group).
 // `schema` must describe a struct (the record batch); `batch` is the matching
 // struct array. On failure, a human-readable message is written to `err` (if
@@ -81,6 +97,10 @@ const char* n2p_writer_last_error(const N2PWriter* w);
 // Select the codec for subsequent batches (default ZSTD). Returns N2P_OK or
 // N2P_INVALID_ARGUMENT.
 int n2p_writer_set_codec(N2PWriter* w, N2PCodec codec);
+
+// Select the page encodings for subsequent batches (default N2P_ENCODING_AUTO). Returns N2P_OK or
+// N2P_INVALID_ARGUMENT.
+int n2p_writer_set_encoding(N2PWriter* w, N2PEncoding encoding);
 
 #ifdef __cplusplus
 }

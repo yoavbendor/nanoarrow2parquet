@@ -390,6 +390,9 @@ public:
     N2PStatus set_codec(N2PCodec codec) {
         return static_cast<N2PStatus>(n2p_writer_set_codec(w_, codec));
     }
+    N2PStatus set_encoding(N2PEncoding encoding) {
+        return static_cast<N2PStatus>(n2p_writer_set_encoding(w_, encoding));
+    }
 
     // Write one row group from one column per field, in field order. REQUIRED
     // fields take a plain contiguous range; Nullable fields take present(...) or

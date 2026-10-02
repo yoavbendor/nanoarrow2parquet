@@ -17,6 +17,13 @@ representation, so it controls the complexity:
   dedup + best compression) when values repeat, falling back to `PLAIN` when the
   data is high-cardinality and the dictionary would be larger than the raw bytes.
 - Every page body is **compressed** (ZSTD by default).
+- Every column chunk carries **statistics** (min / max / null count in Parquet's
+  type-defined orders), so readers can skip row groups.
+- Other encodings on request (`n2p_writer_set_encoding`): `DELTA_BINARY_PACKED` for
+  integers and `DELTA_BYTE_ARRAY` for strings (sorted or slowly changing data),
+  `BYTE_STREAM_SPLIT` for floats, or `PLAIN` everywhere. Levels and dictionary
+  indices are RLE / bit-packed hybrid streams. All encoders are nanom's
+  (`nanom/columnar_encode.hpp`), each round-tripped and fuzzed against nanom's decoders.
 
 Page headers and the footer are the Parquet model of [nanom](https://github.com/yoavbendor/nanom)
 (`nanom/formats/parquet_thrift.hpp`). It is the same set of structs the
@@ -143,6 +150,7 @@ if (n2p_write_file("out.parquet", &schema, &batch, err, sizeof err) != N2P_OK)
 N2PWriter* w;
 n2p_writer_open(&w, "out.parquet");
 n2p_writer_set_codec(w, N2P_CODEC_ZSTD);          // MUST be before the first write_batch
+n2p_writer_set_encoding(w, N2P_ENCODING_AUTO);    // optional: PLAIN / DELTA / BYTE_STREAM_SPLIT
 for (/* each batch */) n2p_writer_write_batch(w, &schema, &batch);
 n2p_writer_close(w);                              // writes the footer, frees w
 ```
@@ -155,7 +163,8 @@ n2p_writer_close(w);                              // writes the footer, frees w
 
 **Don't**
 - Don't put a null in a REQUIRED (non-nullable) column — it is rejected.
-- Don't expect lists/maps, page statistics, bloom filters, or a read path — none exist. Flatten
+- Don't expect lists/maps, page indexes, bloom filters, or a read path — none exist (chunk-level
+  statistics do). Flatten
   lists or emit a child table joined by an id column.
 - Don't skip `close()` — a file with no footer is unreadable (no partial-read fallback).
 - Don't rely on `uint64` deserializing as unsigned in every reader; it is stored as INT64 + the

@@ -85,6 +85,7 @@ struct Config {
     bool strings = true;             // include the dictionary-encoded string cols
     bool wide = false;               // include the extra-type columns (see below)
     int null_pct = 0;                // 0 = REQUIRED columns; >0 = OPTIONAL w/ nulls
+    int encoding = 0;                // N2PEncoding: 0 auto, 1 plain, 2 delta, 3 byte_stream_split
     std::string out = "/tmp/n2p_bench.parquet";
 
     bool nullable() const { return null_pct > 0; }
@@ -128,6 +129,10 @@ inline Config parse_config(int argc, char** argv, const char* default_out) {
         else if (a == "--wide") c.wide = true;
         else if (a == "--no-wide") c.wide = false;
         else if (a == "--null-pct") c.null_pct = static_cast<int>(std::strtoul(next(), nullptr, 10));
+        else if (a == "--encoding") {
+            const std::string v = next();
+            c.encoding = v == "plain" ? 1 : v == "delta" ? 2 : (v == "bss" || v == "byte_stream_split") ? 3 : 0;
+        }
         else if (a == "--out") c.out = next();
         else { std::fprintf(stderr, "unknown flag: %s\n", a.c_str()); std::exit(2); }
     }

@@ -44,18 +44,23 @@ class Writer:
         lib.n2p_writer_open.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_char_p]
         lib.n2p_writer_write_batch.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
         lib.n2p_writer_set_codec.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        lib.n2p_writer_set_encoding.argtypes = [ctypes.c_void_p, ctypes.c_int]
         lib.n2p_writer_close.argtypes = [ctypes.c_void_p]
         lib.n2p_writer_last_error.argtypes = [ctypes.c_void_p]
         lib.n2p_writer_last_error.restype = ctypes.c_char_p
         self.lib = lib
 
-    def write(self, path, batches, codec):
+    ENCODINGS = {"auto": 0, "plain": 1, "delta": 2, "byte_stream_split": 3}
+
+    def write(self, path, batches, codec, encoding="auto"):
         w = ctypes.c_void_p()
         if self.lib.n2p_writer_open(ctypes.byref(w), path.encode()) != 0:
             raise RuntimeError("n2p_writer_open failed")
         try:
             if codec == "uncompressed" and self.lib.n2p_writer_set_codec(w, 1) != 0:
                 raise RuntimeError("set_codec failed")
+            if self.lib.n2p_writer_set_encoding(w, self.ENCODINGS[encoding]) != 0:
+                raise RuntimeError("set_encoding failed")
             for b in batches:
                 c_schema = ffi.new("struct ArrowSchema*")
                 c_array = ffi.new("struct ArrowArray*")
@@ -220,6 +225,53 @@ def struct_bits(v, t):
     return struct.pack("<f" if t == pa.float32() else "<d", v)
 
 
+def leaf_columns(table):
+    """Leaf columns by dotted path; struct parents' nulls are merged into their children."""
+    while any(pa.types.is_struct(f.type) for f in table.schema):
+        table = table.flatten()
+    return {name: table[name].combine_chunks() for name in table.column_names}
+
+
+def expected_stats(arr):
+    """(null_count, min, max) by Parquet's rules: NaN ignored, bytes compared unsigned."""
+    values = [v for v in arr.to_pylist() if v is not None]
+    nulls = len(arr) - len(values)
+    if pa.types.is_floating(arr.type):
+        values = [v for v in values if not math.isnan(v)]
+    if not values or pa.types.is_null(arr.type):
+        return nulls, None, None
+    if pa.types.is_string(arr.type) or pa.types.is_large_string(arr.type):
+        key = lambda v: v.encode()  # noqa: E731 - UTF-8 byte order
+    else:
+        key = None
+    return nulls, min(values, key=key), max(values, key=key)
+
+
+def check_statistics(path, failures, name):
+    pf = pq.ParquetFile(path)
+    for g in range(pf.metadata.num_row_groups):
+        leaves = leaf_columns(pf.read_row_group(g))
+        rg = pf.metadata.row_group(g)
+        for c in range(rg.num_columns):
+            cc = rg.column(c)
+            st = cc.statistics
+            arr = leaves.get(cc.path_in_schema)
+            if st is None or arr is None:
+                failures.append(f"{name}: rg {g} {cc.path_in_schema}: no statistics")
+                continue
+            nulls, mn, mx = expected_stats(arr)
+            if st.null_count != nulls:
+                failures.append(f"{name}: rg {g} {cc.path_in_schema}: null_count {st.null_count} != {nulls}")
+            if mn is None:
+                if st.has_min_max and not pa.types.is_null(arr.type):
+                    failures.append(f"{name}: rg {g} {cc.path_in_schema}: min/max without values")
+                continue
+            if not st.has_min_max:
+                failures.append(f"{name}: rg {g} {cc.path_in_schema}: no min/max")
+            elif st.min != mn or st.max != mx:
+                failures.append(f"{name}: rg {g} {cc.path_in_schema}: min/max {st.min!r}/{st.max!r} != {mn!r}/{mx!r}")
+
+
 def check_metadata(path, rs_meta, failures, name):
     pm = pq.ParquetFile(path).metadata
     size = os.path.getsize(path)
@@ -278,12 +330,14 @@ def main():
     rng = random.Random(20261002)
     failures, files = [], 0
     with tempfile.TemporaryDirectory() as tmp:
+        variants = [("zstd", "auto"), ("uncompressed", "auto"), ("zstd", "plain"), ("zstd", "delta"),
+                    ("uncompressed", "delta"), ("zstd", "byte_stream_split")]
         for name, batches in make_cases(rng):
-            for codec in ("zstd", "uncompressed"):
-                case = f"{name}/{codec}"
+            for codec, encoding in variants:
+                case = f"{name}/{codec}/{encoding}"
                 path = os.path.join(tmp, "t.parquet")
                 try:
-                    writer.write(path, batches, codec)
+                    writer.write(path, batches, codec, encoding)
                 except RuntimeError as e:
                     failures.append(f"{case}: write failed: {e}")
                     continue
@@ -307,6 +361,7 @@ def main():
                     if not ok:
                         failures.append(f"{case}: {reader}: {why}")
                 check_metadata(path, rs_meta, failures, case)
+                check_statistics(path, failures, case)
         # a writer that receives no batch still produces a valid, empty file
         path = os.path.join(tmp, "empty.parquet")
         writer.write(path, [], "zstd")

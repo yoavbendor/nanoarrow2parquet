@@ -44,13 +44,17 @@ void test_bit_width() {
     require(n2p::dictionary_bit_width(257) == 9, "bit width of 257-entry dict");
 }
 
-void test_bit_pack() {
-    // Three 2-bit values 1,2,3 -> 0b11_10_01 = 0x39 in the low byte (LSB-first).
-    std::vector<std::uint32_t> vals = {1, 2, 3};
-    std::vector<std::uint8_t> out;
-    n2p::bit_pack(vals, 2, out);
-    require(out.size() == 1, "3x2-bit values pack into one byte");
-    require(out[0] == 0x39, "LSB-first bit packing");
+void test_index_encoding() {
+    // dictionary indices with runs and noise: nanom's hybrid encoder, read back by its decoder
+    std::vector<std::uint32_t> idx;
+    for (int i = 0; i < 50; ++i) idx.push_back(static_cast<std::uint32_t>(i % 5));
+    idx.insert(idx.end(), 100, 3u);
+    idx.push_back(4);
+    const auto enc = n2p::encode_rle_dictionary_indices(idx, 3);
+    nanom::columnar::rle_bp_decoder d(std::as_bytes(std::span(enc)), 3);
+    std::vector<std::uint32_t> back(idx.size());
+    require(d.get(back.data(), back.size()) == back.size() && back == idx, "index stream round trip");
+    require(enc.size() < (idx.size() * 3 + 7) / 8, "the run of 100 is an RLE run, not 100 packed values");
 }
 
 // Build a small all-fixed batch and assert n2p_write_file produces a framed file.
@@ -183,7 +187,7 @@ void test_null_handling() {
 
 int main() {
     test_bit_width();
-    test_bit_pack();
+    test_index_encoding();
     test_write_framing();
     test_null_handling();
     if (g_failures != 0) {
