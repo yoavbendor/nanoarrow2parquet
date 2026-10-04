@@ -264,6 +264,11 @@ if(N2P_BUILD_TESTS)
     # Nested struct column roundtrip (multi-level definition levels).
     add_executable(test_struct tests/test_struct.cpp)
     target_link_libraries(test_struct PRIVATE nanoarrow2parquet nanoarrow_static)
+    # Malformed lists and maps (offsets backwards / past the child, nulls where none are allowed,
+    # slices) are refused, never read out of bounds.
+    add_executable(test_list_refusals tests/test_list_refusals.cpp)
+    target_link_libraries(test_list_refusals PRIVATE nanoarrow2parquet nanoarrow_static)
+    add_test(NAME list_refusals COMMAND test_list_refusals ${CMAKE_CURRENT_BINARY_DIR}/n2p_list_refusals.parquet)
 
     # Mixed-type wide table (uint8/16/32/64, float32/64) across the 16384 boundary,
     # REQUIRED and nullable -- regression guard for the mixed-type corruption report.
