@@ -65,8 +65,12 @@ so the same Arrow data feeds either writer (Parquet or Lance).
 | `+s` | group (struct) | nested, recurses to leaf columns |
 | any nullable | + definition levels | OPTIONAL repetition, present values only |
 
-**Out of scope (TODO):** nested list/map columns (repetition levels), page
-statistics / indexes, bloom filters, `DELTA_*` / `BYTE_STREAM_SPLIT` encodings.
+Every column chunk carries min / max / null-count statistics. `n2p_writer_set_encoding()` picks
+AUTO (the table above), PLAIN, DELTA (`DELTA_BINARY_PACKED` / `DELTA_BYTE_ARRAY`) or
+`BYTE_STREAM_SPLIT` (floats).
+
+**Out of scope (TODO):** nested list/map columns (repetition levels), page indexes, bloom
+filters.
 
 ### Gotchas & limits
 
