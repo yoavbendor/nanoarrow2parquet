@@ -226,7 +226,15 @@ if(N2P_BUILD_TESTS)
     add_library(n2p_oracle_c SHARED src/writer.cpp)
     target_include_directories(n2p_oracle_c PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    target_link_libraries(n2p_oracle_c PRIVATE nanoarrow_static nanom::nanom ${N2P_ZSTD_TARGET})
+    # A shared library cannot take a distro's static libzstd.a (built without -fPIC): link the
+    # package's shared zstd when there is one, else the in-tree static build, compiled with -fPIC.
+    set(_n2p_oracle_zstd ${N2P_ZSTD_TARGET})
+    if(TARGET zstd::libzstd_shared)
+        set(_n2p_oracle_zstd zstd::libzstd_shared)
+    elseif(TARGET libzstd_static)
+        set_target_properties(libzstd_static PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    endif()
+    target_link_libraries(n2p_oracle_c PRIVATE nanoarrow_static nanom::nanom ${_n2p_oracle_zstd})
     add_executable(test_roundtrip tests/test_roundtrip.cpp)
     target_include_directories(test_roundtrip PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(test_roundtrip PRIVATE nanoarrow2parquet nanoarrow_static nanom::nanom)
