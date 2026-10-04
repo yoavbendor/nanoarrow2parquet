@@ -17,10 +17,19 @@ representation, so it controls the complexity:
   dedup + best compression) when values repeat, falling back to `PLAIN` when the
   data is high-cardinality and the dictionary would be larger than the raw bytes.
 - Every page body is **compressed** (ZSTD by default).
+- Every column chunk carries **statistics** (min / max / null count in Parquet's
+  type-defined orders), so readers can skip row groups.
+- Other encodings on request (`n2p_writer_set_encoding`): `DELTA_BINARY_PACKED` for
+  integers and `DELTA_BYTE_ARRAY` for strings (sorted or slowly changing data),
+  `BYTE_STREAM_SPLIT` for floats, or `PLAIN` everywhere. Levels and dictionary
+  indices are RLE / bit-packed hybrid streams. All encoders are nanom's
+  (`nanom/columnar_encode.hpp`), each round-tripped and fuzzed against nanom's decoders.
 
-The only real format work is a small Thrift *compact protocol* encoder
-(`src/thrift_compact.hpp`) and the metadata structs (`src/parquet_types.hpp`,
-`src/writer.cpp`) — no Thrift library, no SIMD, no decode path.
+Page headers and the footer are the Parquet model of [nanom](https://github.com/yoavbendor/nanom)
+(`nanom/formats/parquet_thrift.hpp`). It is the same set of structs the
+[parquet2nanoarrow](https://github.com/yoavbendor/parquet2nanoarrow) reader decodes, and nanom's
+Thrift compact encoder (`nanom/tagged_encode.hpp`) writes it. There is no Thrift library, no
+hand-written encoder, and no second copy of `parquet.thrift` to drift out of sync.
 
 ## Scope
 
@@ -56,8 +65,12 @@ so the same Arrow data feeds either writer (Parquet or Lance).
 | `+s` | group (struct) | nested, recurses to leaf columns |
 | any nullable | + definition levels | OPTIONAL repetition, present values only |
 
-**Out of scope (TODO):** nested list/map columns (repetition levels), page
-statistics / indexes, bloom filters, `DELTA_*` / `BYTE_STREAM_SPLIT` encodings.
+Every column chunk carries min / max / null-count statistics. `n2p_writer_set_encoding()` picks
+AUTO (the table above), PLAIN, DELTA (`DELTA_BINARY_PACKED` / `DELTA_BYTE_ARRAY`) or
+`BYTE_STREAM_SPLIT` (floats).
+
+**Out of scope (TODO):** nested list/map columns (repetition levels), page indexes, bloom
+filters.
 
 ### Gotchas & limits
 
@@ -141,6 +154,7 @@ if (n2p_write_file("out.parquet", &schema, &batch, err, sizeof err) != N2P_OK)
 N2PWriter* w;
 n2p_writer_open(&w, "out.parquet");
 n2p_writer_set_codec(w, N2P_CODEC_ZSTD);          // MUST be before the first write_batch
+n2p_writer_set_encoding(w, N2P_ENCODING_AUTO);    // optional: PLAIN / DELTA / BYTE_STREAM_SPLIT
 for (/* each batch */) n2p_writer_write_batch(w, &schema, &batch);
 n2p_writer_close(w);                              // writes the footer, frees w
 ```
@@ -153,7 +167,8 @@ n2p_writer_close(w);                              // writes the footer, frees w
 
 **Don't**
 - Don't put a null in a REQUIRED (non-nullable) column — it is rejected.
-- Don't expect lists/maps, page statistics, bloom filters, or a read path — none exist. Flatten
+- Don't expect lists/maps, page indexes, bloom filters, or a read path — none exist (chunk-level
+  statistics do). Flatten
   lists or emit a child table joined by an id column.
 - Don't skip `close()` — a file with no footer is unreadable (no partial-read fallback).
 - Don't rely on `uint64` deserializing as unsigned in every reader; it is stored as INT64 + the
@@ -282,7 +297,7 @@ implementation macro first:
 
 Everywhere else, `#include "nanoarrow2parquet.h"` with no macro for just the C ABI.
 This is link-time equivalent to compiling `src/writer.cpp`: the header still needs
-the **nanoarrow** and **zstd** headers on the include path and links **libzstd**
+the **nanoarrow**, **zstd** and (header-only) **nanom** headers on the include path and links **libzstd**
 (use `N2P_CODEC_UNCOMPRESSED` if you want to avoid zstd at runtime). With CMake,
 link `nanoarrow2parquet::single` instead of the static library.
 
@@ -319,13 +334,22 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-Dependencies (`nanoarrow`, `zstd`) are fetched via CMake `FetchContent`; nanoarrow
-is pinned to the same commit nanolance uses. Embedding parents that already provide
+Dependencies (`nanoarrow`, `zstd`, and the header-only `nanom`) are fetched via CMake
+`FetchContent`; nanoarrow is pinned to the same commit nanolance uses, nanom to a commit
+(`-DFETCHCONTENT_SOURCE_DIR_NANOM=/path` develops against a local checkout). Embedding parents that already provide
 `nanoarrow_static` / a `zstd` target are reused automatically.
 
 `ctest` runs:
-- `test_roundtrip` — unit checks of the compact-protocol encoder, the RLE/bit-pack
-  encoder, file framing, and null rejection.
+- `test_roundtrip` — unit checks of the RLE/bit-pack encoder, file framing and null
+  rejection. The written footer and every page header are decoded back through nanom's model:
+  pages must tile each column chunk and the value counts must add up.
+- `oracle_roundtrip` — format correctness against independent readers. A matrix of tables is
+  written through the C API and must read back exactly in **pyarrow** and **arrow-rs** (the Rust
+  `parquet` crate, `tests/arrow_rs_oracle`, built by cargo when available), and in
+  **parquet2nanoarrow** when `-DN2P_P2N_C_LIB=` points at its C library. The matrix covers every
+  supported type, nulls at every level, nested structs, several row groups, empty / unicode /
+  long strings, NaN and ±0, and both codecs. The footer as arrow-rs decodes it must match
+  pyarrow's field by field, and the column chunks must tile the file.
 - `test_single_header` — compiles two TUs against the amalgamated header (one
   defining `NANOARROW2PARQUET_IMPLEMENTATION`) and writes a file, proving the
   single-header build compiles and links with no ODR clashes.

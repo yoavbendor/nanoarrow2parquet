@@ -24,12 +24,12 @@ namespace n2p {
 // UNCOMPRESSED, returns a copy of the input. Throws std::runtime_error on a codec
 // failure (callers translate to N2P_IO_ERROR).
 inline std::vector<std::uint8_t> compress_page(std::span<const std::uint8_t> src,
-                                               pq::Codec codec,
+                                               pq::CompressionCodec codec,
                                                int level = 3) {
-    if (codec == pq::Codec::Uncompressed) {
+    if (codec == pq::CompressionCodec::UNCOMPRESSED) {
         return std::vector<std::uint8_t>(src.begin(), src.end());
     }
-    // pq::Codec::Zstd
+    // pq::CompressionCodec::ZSTD
     const std::size_t bound = ZSTD_compressBound(src.size());
     std::vector<std::uint8_t> dst(bound);
     const std::size_t n = ZSTD_compress(dst.data(), dst.size(),

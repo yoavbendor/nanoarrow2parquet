@@ -29,7 +29,9 @@ jobs:
           # pyarrow provides both the readback used by the smoke test and the
           # libparquet/libarrow + headers the Apache benchmark baseline links.
           python3 -m pip install --upgrade pip
-          python3 -m pip install "pyarrow>=16" pandas
+          python3 -m pip install "pyarrow>=16" pandas cffi
+          # cargo (preinstalled on the runner) builds tests/arrow_rs_oracle: the arrow-rs reader
+          # the oracle_roundtrip test checks every written file against.
 
       # FetchContent pulls nanoarrow + builds zstd from source; cache so only the
       # first run pays for it.
@@ -51,7 +53,8 @@ jobs:
         run: cmake --build build
 
       # Correctness: roundtrip unit test, single-header ODR build, amalgamation
-      # freshness, pyarrow smoke roundtrip, and the bench regression gate. The
+      # freshness, pyarrow smoke roundtrip, the pyarrow + arrow-rs oracle round
+      # trip, and the bench regression gate. The
       # regression gate compares n2p vs Apache Parquet C++ on this same runner, so
       # its ratios are stable despite shared-runner noise.
       - name: Run tests (ctest)

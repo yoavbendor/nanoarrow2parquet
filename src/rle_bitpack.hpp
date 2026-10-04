@@ -3,22 +3,17 @@
 
 #pragma once
 
-// Minimal RLE / bit-packing-hybrid encoder for Parquet dictionary indices.
-//
-// The hybrid stream is a sequence of runs, each prefixed by a varint header whose
-// low bit selects the run kind:
-//   * bit-packed run : header = (num_groups << 1) | 1, followed by num_groups
-//                      groups of 8 values, each `bit_width` bits, packed LSB-first.
-//   * RLE run        : header = (run_length << 1) | 0, followed by one value in
-//                      ceil(bit_width/8) bytes.
-//
-// We emit the simplest spec-compliant form: a single bit-packed run covering all
-// indices (the last group zero-padded). Literal RLE runs would improve the ratio
-// but are not required for correctness, and page-level compression recovers most
-// of the gap anyway.
+// RLE / bit-packed hybrid streams (dictionary indices, definition levels), encoded by nanom's
+// columnar encoders (nanom/columnar_encode.hpp): runs of >= 8 equal values become RLE runs, the
+// rest bit-packed groups of 8. These are the encoders whose output nanom's decoders (and every
+// Parquet reader) read; nanom round-trips and fuzzes each one.
+
+#include <nanom/columnar_encode.hpp>
 
 #include <cstdint>
+#include <cstring>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace n2p {
@@ -32,72 +27,50 @@ inline int dictionary_bit_width(std::size_t dict_size) {
     return w;  // 0 when dict_size <= 1
 }
 
-// LSB-first bit-pack `values` (each masked to `bit_width` bits) into `out`.
-inline void bit_pack(std::span<const std::uint32_t> values, int bit_width,
-                     std::vector<std::uint8_t>& out) {
-    if (bit_width == 0) {
-        return;  // every value is implicitly 0; no bytes emitted
-    }
-    const std::uint64_t mask =
-        (bit_width >= 32) ? 0xFFFFFFFFu : ((std::uint32_t{1} << bit_width) - 1);
-    std::uint64_t buffer = 0;
-    int bits = 0;
-    for (std::uint32_t v : values) {
-        buffer |= (static_cast<std::uint64_t>(v) & mask) << bits;
-        bits += bit_width;
-        while (bits >= 8) {
-            out.push_back(static_cast<std::uint8_t>(buffer & 0xFF));
-            buffer >>= 8;
-            bits -= 8;
-        }
-    }
-    if (bits > 0) {
-        out.push_back(static_cast<std::uint8_t>(buffer & 0xFF));
-    }
+inline void append_bytes(std::vector<std::uint8_t>& out, const std::vector<std::byte>& in) {
+    const std::size_t at = out.size();
+    out.resize(at + in.size());
+    if (!in.empty()) std::memcpy(out.data() + at, in.data(), in.size());
 }
 
-// Encode `indices` as the body of an RLE_DICTIONARY data page: a single
-// zero-padded bit-packed run. Does NOT include the leading bit-width byte (the
-// writer prepends that). `bit_width` must come from dictionary_bit_width().
+// The body of an RLE_DICTIONARY data page after its bit-width byte (the writer prepends that).
 inline std::vector<std::uint8_t> encode_rle_dictionary_indices(
     std::span<const std::uint32_t> indices, int bit_width) {
+    std::vector<std::byte> enc;
+    nanom::columnar::rle_hybrid_encode<std::uint32_t>(indices, static_cast<unsigned>(bit_width), enc);
     std::vector<std::uint8_t> out;
-    const std::size_t num_groups = (indices.size() + 7) / 8;
-
-    // Varint header: (num_groups << 1) | 1. num_groups is tiny in practice but
-    // varint-encode it for safety with large pages.
-    std::uint64_t header = (static_cast<std::uint64_t>(num_groups) << 1) | 1u;
-    while (header >= 0x80) {
-        out.push_back(static_cast<std::uint8_t>(header) | 0x80);
-        header >>= 7;
-    }
-    out.push_back(static_cast<std::uint8_t>(header));
-
-    // Pad up to num_groups * 8 values with zeros so the run is group-aligned.
-    const std::size_t padded = num_groups * 8;
-    std::vector<std::uint32_t> tmp(indices.begin(), indices.end());
-    tmp.resize(padded, 0);
-    bit_pack(tmp, bit_width, out);
+    append_bytes(out, enc);
     return out;
 }
 
-// Encode a definition-level sequence for a flat OPTIONAL column (max def level 1,
-// so bit_width 1) as the leading bytes of a DataPage V1 body: a 4-byte
-// little-endian length followed by the RLE/bit-pack-hybrid run. `levels[i]` is 1
-// for a present value and 0 for a null. Reuses the same single bit-packed run as
-// the dictionary indices -- 1 bit/level, which page compression then collapses
-// (an all-present column's levels compress to almost nothing).
-inline std::vector<std::uint8_t> encode_definition_levels(
-    std::span<const std::uint32_t> levels, int bit_width) {
-    const std::vector<std::uint8_t> run = encode_rle_dictionary_indices(levels, bit_width);
+// The leading bytes of a DataPage V1 body: a 4-byte little-endian length, then the hybrid stream.
+inline std::vector<std::uint8_t> with_length_prefix(const std::vector<std::byte>& run) {
+    if (run.size() > UINT32_MAX) throw std::length_error("definition levels larger than 4 GiB");
     std::vector<std::uint8_t> out;
+    out.reserve(4 + run.size());
     const std::uint32_t len = static_cast<std::uint32_t>(run.size());
     out.push_back(len & 0xFF);
     out.push_back((len >> 8) & 0xFF);
     out.push_back((len >> 16) & 0xFF);
     out.push_back((len >> 24) & 0xFF);
-    out.insert(out.end(), run.begin(), run.end());
+    append_bytes(out, run);
     return out;
+}
+
+// Definition levels (each <= 2^bit_width - 1), length-prefixed.
+inline std::vector<std::uint8_t> encode_definition_levels(
+    std::span<const std::uint32_t> levels, int bit_width) {
+    std::vector<std::byte> run;
+    nanom::columnar::rle_hybrid_encode<std::uint32_t>(levels, static_cast<unsigned>(bit_width), run);
+    return with_length_prefix(run);
+}
+
+// Definition levels of a column with max level 1, straight from its presence bitmap (bit i set =
+// row i present), length-prefixed. No per-row level array is built.
+inline std::vector<std::uint8_t> encode_definition_levels_bitmap(const std::uint8_t* present, std::size_t n) {
+    std::vector<std::byte> run;
+    nanom::columnar::rle_bitmap_encode(present, n, run);
+    return with_length_prefix(run);
 }
 
 }  // namespace n2p

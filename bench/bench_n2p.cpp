@@ -25,6 +25,11 @@ int main(int argc, char** argv) {
         n2p_writer_close(w);
         return 1;
     }
+    if (n2p_writer_set_encoding(w, static_cast<N2PEncoding>(cfg.encoding)) != N2P_OK) {
+        std::fprintf(stderr, "n2p set encoding failed\n");
+        n2p_writer_close(w);
+        return 1;
+    }
     if (!cfg.compress && n2p_writer_set_codec(w, N2P_CODEC_UNCOMPRESSED) != N2P_OK) {
         std::fprintf(stderr, "n2p set codec failed\n");
         n2p_writer_close(w);

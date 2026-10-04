@@ -41,6 +41,24 @@ if(NOT TARGET nanoarrow_static)
     FetchContent_MakeAvailable(nanoarrow)
 endif()
 
+# --- nanom (header-only): the Parquet metadata model and its Thrift compact encoder ---
+# Page headers and the footer are nanom_formats::parquet structs (the same model
+# parquet2nanoarrow reads), written with nanom/tagged_encode.hpp. Pinned; point
+# FETCHCONTENT_SOURCE_DIR_NANOM at a local checkout to develop both together.
+if(NOT TARGET nanom::nanom)
+    FetchContent_Declare(nanom
+        GIT_REPOSITORY https://github.com/yoavbendor/nanom.git
+        GIT_TAG 1798c104e128e9feef2b007206d7fff45e54e90d
+    )
+    FetchContent_GetProperties(nanom)
+    if(NOT nanom_POPULATED)
+        FetchContent_Populate(nanom)  # headers only: do not pull nanom's tests/benches into this build
+    endif()
+    add_library(n2p_nanom INTERFACE)
+    target_include_directories(n2p_nanom SYSTEM INTERFACE ${nanom_SOURCE_DIR}/include)
+    add_library(nanom::nanom ALIAS n2p_nanom)
+endif()
+
 # --- zstd (page compression) ---
 set(N2P_ZSTD_TARGET "")
 if(TARGET libzstd_static)
@@ -82,7 +100,7 @@ target_include_directories(nanoarrow2parquet PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 target_include_directories(nanoarrow2parquet PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(nanoarrow2parquet PUBLIC nanoarrow_static PRIVATE ${N2P_ZSTD_TARGET})
+target_link_libraries(nanoarrow2parquet PUBLIC nanoarrow_static PRIVATE nanom::nanom ${N2P_ZSTD_TARGET})
 add_library(nanoarrow2parquet::nanoarrow2parquet ALIAS nanoarrow2parquet)
 
 # --- single-header amalgamation ---
@@ -103,10 +121,11 @@ if(Python3_Interpreter_FOUND)
 endif()
 
 # Header-only interface target for embedders who prefer the single header. They
-# still link nanoarrow + zstd (the implementation depends on both).
+# still link nanoarrow + zstd and need nanom's headers (the implementation uses all three).
 add_library(nanoarrow2parquet_single INTERFACE)
 target_include_directories(nanoarrow2parquet_single INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/single_include>)
+target_link_libraries(nanoarrow2parquet_single INTERFACE nanom::nanom)  # header-only
 add_library(nanoarrow2parquet::single ALIAS nanoarrow2parquet_single)
 
 if(N2P_BUILD_EXAMPLES)
@@ -122,18 +141,20 @@ if(N2P_BUILD_EXAMPLES)
     # needed for its bulk path, which this example does not use -- decode runs serially) never runs.
     set(N2P_NANOTINS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/examples/pcapng2parquet/extern/nanotins)
     if(NOT EXISTS "${N2P_NANOTINS_DIR}/CMakeLists.txt")
-        message(FATAL_ERROR
-            "examples/pcapng2parquet/extern/nanotins is empty -- run: "
-            "git submodule update --init --recursive")
-    endif()
-    add_subdirectory(${N2P_NANOTINS_DIR}/soatins ${CMAKE_CURRENT_BINARY_DIR}/soatins)
+        # The other examples (and the tests that use them) do not need nanotins: skip only this one.
+        message(WARNING
+            "examples/pcapng2parquet/extern/nanotins is empty -- pcapng2parquet is skipped "
+            "(run: git submodule update --init --recursive)")
+    else()
+        add_subdirectory(${N2P_NANOTINS_DIR}/soatins ${CMAKE_CURRENT_BINARY_DIR}/soatins)
 
-    add_executable(pcapng2parquet examples/pcapng2parquet/src/pcapng2parquet_main.cpp)
-    target_include_directories(pcapng2parquet PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/examples/pcapng2parquet/include
-        ${N2P_NANOTINS_DIR}/nanotins/include
-        ${N2P_NANOTINS_DIR}/examples/lldp)  # the user-written LLDP DPAR palette (lldp.hpp)
-    target_link_libraries(pcapng2parquet PRIVATE nanoarrow2parquet nanoarrow_static soatins_core)
+        add_executable(pcapng2parquet examples/pcapng2parquet/src/pcapng2parquet_main.cpp)
+        target_include_directories(pcapng2parquet PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/examples/pcapng2parquet/include
+            ${N2P_NANOTINS_DIR}/nanotins/include
+            ${N2P_NANOTINS_DIR}/examples/lldp)  # the user-written LLDP DPAR palette (lldp.hpp)
+        target_link_libraries(pcapng2parquet PRIVATE nanoarrow2parquet nanoarrow_static soatins_core)
+    endif()
 endif()
 
 # --- benchmarks (vs Apache Parquet C++) ---
@@ -199,9 +220,24 @@ endif()
 
 if(N2P_BUILD_TESTS)
     enable_testing()
+
+    # The writer as a shared C library, so tests/oracle_roundtrip.py can drive it from Python
+    # (ctypes + the Arrow C Data Interface) with any pyarrow table.
+    add_library(n2p_oracle_c SHARED src/writer.cpp)
+    target_include_directories(n2p_oracle_c PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    # A shared library cannot take a distro's static libzstd.a (built without -fPIC): link the
+    # package's shared zstd when there is one, else the in-tree static build, compiled with -fPIC.
+    set(_n2p_oracle_zstd ${N2P_ZSTD_TARGET})
+    if(TARGET zstd::libzstd_shared)
+        set(_n2p_oracle_zstd zstd::libzstd_shared)
+    elseif(TARGET libzstd_static)
+        set_target_properties(libzstd_static PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    endif()
+    target_link_libraries(n2p_oracle_c PRIVATE nanoarrow_static nanom::nanom ${_n2p_oracle_zstd})
     add_executable(test_roundtrip tests/test_roundtrip.cpp)
     target_include_directories(test_roundtrip PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    target_link_libraries(test_roundtrip PRIVATE nanoarrow2parquet nanoarrow_static)
+    target_link_libraries(test_roundtrip PRIVATE nanoarrow2parquet nanoarrow_static nanom::nanom)
     add_test(NAME test_roundtrip COMMAND test_roundtrip)
 
     # Single-header build: two TUs share the amalgamated header (one defines the
@@ -269,6 +305,28 @@ if(N2P_BUILD_TESTS)
                              ${CMAKE_CURRENT_SOURCE_DIR}/examples/pcapng2parquet/tests/check_pcapng2parquet.py
                              $<TARGET_FILE:pcapng2parquet>)
             set_tests_properties(pcapng2parquet_check PROPERTIES SKIP_RETURN_CODE 77)
+        endif()
+
+        # Format correctness against independent readers: every written table must read back
+        # exactly in pyarrow, arrow-rs (tests/arrow_rs_oracle, built by cargo when available) and,
+        # when N2P_P2N_C_LIB points at libparquet2nanoarrow_c, parquet2nanoarrow; footers must agree.
+        set(N2P_P2N_C_LIB "-" CACHE STRING "parquet2nanoarrow C ABI library for the oracle test (- = skip)")
+        find_program(N2P_CARGO cargo)
+        set(_n2p_rs_oracle "-")
+        if(N2P_CARGO)
+            set(_n2p_rs_dir ${CMAKE_CURRENT_SOURCE_DIR}/tests/arrow_rs_oracle)
+            add_test(NAME build_arrow_rs_oracle
+                     COMMAND ${N2P_CARGO} build --release --quiet --manifest-path ${_n2p_rs_dir}/Cargo.toml
+                             --target-dir ${CMAKE_CURRENT_BINARY_DIR}/arrow_rs_oracle)
+            set_tests_properties(build_arrow_rs_oracle PROPERTIES FIXTURES_SETUP arrow_rs_oracle TIMEOUT 1800)
+            set(_n2p_rs_oracle ${CMAKE_CURRENT_BINARY_DIR}/arrow_rs_oracle/release/arrow_rs_oracle)
+        endif()
+        add_test(NAME oracle_roundtrip
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/oracle_roundtrip.py
+                         $<TARGET_FILE:n2p_oracle_c> ${_n2p_rs_oracle} ${N2P_P2N_C_LIB})
+        set_tests_properties(oracle_roundtrip PROPERTIES SKIP_RETURN_CODE 77)
+        if(N2P_CARGO)
+            set_tests_properties(oracle_roundtrip PROPERTIES FIXTURES_REQUIRED arrow_rs_oracle)
         endif()
 
         add_test(NAME smoke_pyarrow
