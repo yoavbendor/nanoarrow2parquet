@@ -379,11 +379,23 @@ struct SchemaNode {
     bool is_group = false;
     std::string name;
     bool optional = false;
+    bool repeated = false;         // the repeated group of a LIST / MAP
     int num_children = 0;          // groups only
+    bool list_group = false;       // the outer group of a LIST (converted / logical type LIST)
+    bool map_group = false;        // the outer group of a MAP
     pq::Type type{};               // leaves only
     bool has_converted = false;
     pq::ConvertedType converted{};
     int type_length = 0;
+};
+
+// One Arrow node on a leaf's path, from the record batch's column down to the leaf.
+enum class StepKind { Struct, List, LargeList, Map, Leaf };
+struct PathStep {
+    StepKind kind = StepKind::Leaf;
+    bool optional = false;  // the Arrow node is nullable (its Parquet group / field is OPTIONAL)
+    int child = 0;          // Struct: the child followed; Map: 0 = key, 1 = value; List: 0
+    int rep_level = 0;      // List / Map: this list's repetition level (lists up to and including it)
 };
 
 struct LeafSpec {
@@ -391,38 +403,106 @@ struct LeafSpec {
     std::vector<int> path_idx;          // child indices from the root to the leaf
     std::vector<std::string> path_names;
     std::vector<bool> path_optional;    // OPTIONAL flag per node on the path
-    int max_def_level = 0;              // = count(path_optional == true)
+    int max_def_level = 0;              // = count(path_optional == true) (+ one per list)
     int def_bit_width = 0;
+    // Under a list or map: the leaf is shredded into repetition / definition levels (Dremel) by
+    // walking `steps`; otherwise the row-per-value path above is used, unchanged.
+    bool has_list = false;
+    std::vector<PathStep> steps;
+    int max_rep_level = 0;
+    int rep_bit_width = 0;
 };
 
-// Recursively flatten a schema child (struct group or leaf). `idx/names/opt`
-// already include this node. Appends to `nodes` (footer, pre-order) and, for
-// leaves, to `leaves` (write order).
-bool flatten_schema(const ArrowSchema* node, std::vector<int> idx,
-                    std::vector<std::string> names, std::vector<bool> opt,
-                    std::vector<SchemaNode>& nodes, std::vector<LeafSpec>& leaves,
-                    std::string& err) {
-    const bool nullable = (node->flags & ARROW_FLAG_NULLABLE) != 0;
-    if (node->format != nullptr && std::strcmp(node->format, "+s") == 0) {
+// Recursively flatten a schema child (struct group, list, map or leaf). `idx/names/opt` already
+// include this node; `steps` holds the path's Arrow nodes ABOVE this one; `name` is the node's
+// Parquet name ("element" / "key" / "value" inside lists and maps) and `optional` its repetition.
+// Appends to `nodes` (footer, pre-order) and, for leaves, to `leaves` (write order).
+bool flatten_node(const ArrowSchema* node, const std::string& name, bool optional, std::vector<int> idx,
+                  std::vector<std::string> names, std::vector<bool> opt, std::vector<PathStep> steps,
+                  std::vector<SchemaNode>& nodes, std::vector<LeafSpec>& leaves, std::string& err) {
+    const char* f = node->format != nullptr ? node->format : "";
+    const auto nullable_child = [](const ArrowSchema* c) {
+        return (c->flags & ARROW_FLAG_NULLABLE) != 0 || (c->format && std::strcmp(c->format, "n") == 0);
+    };
+    const int rep_above = steps.empty() ? 0 : [&] {
+        int r = 0;
+        for (const auto& st : steps) if (st.kind == StepKind::List || st.kind == StepKind::LargeList || st.kind == StepKind::Map) ++r;
+        return r;
+    }();
+    if (std::strcmp(f, "+s") == 0) {
         SchemaNode g;
         g.is_group = true;
-        g.name = node->name ? node->name : "";
-        g.optional = nullable;
+        g.name = name;
+        g.optional = optional;
         g.num_children = static_cast<int>(node->n_children);
         nodes.push_back(g);
         for (std::int64_t i = 0; i < node->n_children; ++i) {
             const ArrowSchema* child = node->children[i];
-            const bool child_null = (child->flags & ARROW_FLAG_NULLABLE) != 0 ||
-                                    (child->format && std::strcmp(child->format, "n") == 0);
+            const bool child_null = nullable_child(child);
             auto idx2 = idx; idx2.push_back(static_cast<int>(i));
             auto names2 = names; names2.push_back(child->name ? child->name : "");
             auto opt2 = opt; opt2.push_back(child_null);
-            if (!flatten_schema(child, idx2, names2, opt2, nodes, leaves, err)) return false;
+            auto steps2 = steps; steps2.push_back({StepKind::Struct, optional, static_cast<int>(i), 0});
+            if (!flatten_node(child, child->name ? child->name : "", child_null, idx2, names2, opt2, steps2,
+                              nodes, leaves, err)) return false;
+        }
+        return true;
+    }
+    const bool is_list = std::strcmp(f, "+l") == 0 || std::strcmp(f, "+L") == 0;
+    const bool is_map = std::strcmp(f, "+m") == 0;
+    if (is_list || is_map) {
+        // Parquet's three-level layouts:
+        //   <opt> group name (LIST) { repeated group list { <opt> element; } }
+        //   <opt> group name (MAP)  { repeated group key_value { required key; <opt> value; } }
+        if (node->n_children != 1 || node->children == nullptr) {
+            err = "list / map '" + name + "' must have exactly one child";
+            return false;
+        }
+        SchemaNode outer;
+        outer.is_group = true;
+        outer.name = name;
+        outer.optional = optional;
+        outer.num_children = 1;
+        outer.list_group = is_list;
+        outer.map_group = is_map;
+        nodes.push_back(outer);
+        const ArrowSchema* child = node->children[0];
+        const int rep = rep_above + 1;
+        if (is_list) {
+            SchemaNode r;
+            r.is_group = true;
+            r.name = "list";
+            r.repeated = true;
+            r.num_children = 1;
+            nodes.push_back(r);
+            auto names2 = names; names2.push_back("list"); names2.push_back("element");
+            auto steps2 = steps;
+            steps2.push_back({f[1] == 'L' ? StepKind::LargeList : StepKind::List, optional, 0, rep});
+            return flatten_node(child, "element", nullable_child(child), idx, names2, opt, steps2, nodes, leaves, err);
+        }
+        if (child->format == nullptr || std::strcmp(child->format, "+s") != 0 || child->n_children != 2) {
+            err = "map '" + name + "' entries must be a struct of key and value";
+            return false;
+        }
+        SchemaNode r;
+        r.is_group = true;
+        r.name = "key_value";
+        r.repeated = true;
+        r.num_children = 2;
+        nodes.push_back(r);
+        for (int i = 0; i < 2; ++i) {
+            const ArrowSchema* kv = child->children[i];
+            const char* kv_name = i == 0 ? "key" : "value";
+            auto names2 = names; names2.push_back("key_value"); names2.push_back(kv_name);
+            auto steps2 = steps; steps2.push_back({StepKind::Map, optional, i, rep});
+            // Keys are REQUIRED in Parquet (and non-null in Arrow); values keep their nullability.
+            if (!flatten_node(kv, kv_name, i == 0 ? false : nullable_child(kv), idx, names2, opt, steps2, nodes,
+                              leaves, err)) return false;
         }
         return true;
     }
     // leaf
-    auto spec = map_format(node->format, node->name ? node->name : "", nullable, err);
+    auto spec = map_format(node->format, name, optional, err);
     if (!spec) return false;
     SchemaNode ln;
     ln.name = spec->name; ln.optional = spec->nullable; ln.type = spec->type;
@@ -434,13 +514,127 @@ bool flatten_schema(const ArrowSchema* node, std::vector<int> idx,
     leaf.path_idx = std::move(idx);
     leaf.path_names = std::move(names);
     leaf.path_optional = opt;
-    int D = 0;
-    for (bool o : opt) if (o) ++D;
+    steps.push_back({StepKind::Leaf, leaf.col.nullable, 0, 0});
+    int D = 0, R = 0;
+    for (const auto& st : steps) {
+        if (st.optional) ++D;
+        if (st.kind == StepKind::List || st.kind == StepKind::LargeList || st.kind == StepKind::Map) {
+            ++D;  // the repeated group: a non-empty list
+            ++R;
+        }
+    }
+    leaf.has_list = R > 0;
+    if (leaf.has_list) leaf.steps = std::move(steps);
     leaf.max_def_level = D;
+    leaf.max_rep_level = R;
     leaf.def_bit_width = dictionary_bit_width(static_cast<std::size_t>(D) + 1);
+    leaf.rep_bit_width = dictionary_bit_width(static_cast<std::size_t>(R) + 1);
     leaves.push_back(std::move(leaf));
     return true;
 }
+
+// A top-level column of the record batch.
+bool flatten_schema(const ArrowSchema* node, std::vector<int> idx, std::vector<std::string> names,
+                    std::vector<bool> opt, std::vector<SchemaNode>& nodes, std::vector<LeafSpec>& leaves,
+                    std::string& err) {
+    const bool optional = opt.back();  // before opt is moved into the call
+    return flatten_node(node, node->name ? node->name : "", optional, std::move(idx), std::move(names),
+                        std::move(opt), {}, nodes, leaves, err);
+}
+
+// ---- Dremel shredding (leaves under a list or map) -------------------------
+//
+// One leaf's repetition and definition levels, and which positions of the leaf array hold its
+// values, from a walk of the Arrow arrays on its path. Values come out in increasing position order
+// (list offsets only grow), so `present` is the validity map the value builders already take; leaf
+// positions under a null or empty list are never visited and stay out of it. Every node must have
+// offset 0, and every list's offsets must stay within its child.
+struct Shredded {
+    std::vector<std::uint32_t> rep, def;
+    std::vector<std::uint8_t> present;  // over the leaf array
+    std::size_t present_count = 0;
+};
+
+class Shredder {
+public:
+    Shredder(const LeafSpec& leaf, Shredded& out) : leaf_(leaf), out_(out) {}
+
+    bool row(const ArrowArray* column, std::int64_t e, std::string& err) { return walk(0, column, e, 0, 0, err); }
+
+private:
+    static bool valid(const ArrowArray* a, std::int64_t e) {
+        if (a->null_count == 0 || a->n_buffers < 1 || a->buffers == nullptr || a->buffers[0] == nullptr) return true;
+        const auto* bm = static_cast<const std::uint8_t*>(a->buffers[0]);
+        return (bm[e >> 3] >> (e & 7)) & 1;
+    }
+    void emit(int r, int d) {
+        out_.rep.push_back(static_cast<std::uint32_t>(r));
+        out_.def.push_back(static_cast<std::uint32_t>(d));
+    }
+    bool fail(std::string& err, const char* what) {
+        err = "column '" + leaf_.col.name + "': " + what;
+        return false;
+    }
+    bool walk(std::size_t k, const ArrowArray* a, std::int64_t e, int r, int d, std::string& err) {
+        const PathStep& st = leaf_.steps[k];
+        if (a->offset != 0) return fail(err, "an array on the path has a non-zero offset (slices unsupported)");
+        if (e < 0 || e >= a->length) return fail(err, "an index runs past an array on the path");
+        if (st.optional) {
+            const bool present = st.kind == StepKind::Leaf && leaf_.col.extract == Extract::Null ? false : valid(a, e);
+            if (!present) {
+                emit(r, d);
+                return true;
+            }
+            ++d;
+        } else if (a->null_count > 0 && !valid(a, e)) {
+            return fail(err, "a null in a field that is not nullable");
+        }
+        switch (st.kind) {
+            case StepKind::Leaf:
+                emit(r, d);
+                out_.present[static_cast<std::size_t>(e) >> 3] |= static_cast<std::uint8_t>(1u << (e & 7));
+                ++out_.present_count;
+                return true;
+            case StepKind::Struct:
+                if (a->children == nullptr || st.child >= a->n_children) return fail(err, "batch structure does not match the schema");
+                return walk(k + 1, a->children[st.child], e, r, d, err);
+            case StepKind::List:
+            case StepKind::LargeList:
+            case StepKind::Map: {
+                if (a->n_buffers < 2 || a->buffers == nullptr || a->buffers[1] == nullptr || a->children == nullptr ||
+                    a->n_children < 1)
+                    return fail(err, "a list without offsets or child");
+                std::int64_t s = 0, t = 0;
+                if (st.kind == StepKind::LargeList) {
+                    const auto* off = static_cast<const std::int64_t*>(a->buffers[1]);
+                    s = off[e]; t = off[e + 1];
+                } else {
+                    const auto* off = static_cast<const std::int32_t*>(a->buffers[1]);
+                    s = off[e]; t = off[e + 1];
+                }
+                const ArrowArray* child = a->children[0];
+                if (st.kind == StepKind::Map) {
+                    if (child->offset != 0 || child->children == nullptr || child->n_children != 2)
+                        return fail(err, "map entries must be an offset-0 struct of key and value");
+                    if (t > child->length) return fail(err, "map offsets run past its entries");
+                    child = child->children[st.child];
+                }
+                if (s < 0 || t < s || t > child->length) return fail(err, "list offsets are out of order or past its child");
+                if (s == t) {
+                    emit(r, d);  // an empty list
+                    return true;
+                }
+                for (std::int64_t j = s; j < t; ++j)
+                    if (!walk(k + 1, child, j, j == s ? r : st.rep_level, d + 1, err)) return false;
+                return true;
+            }
+        }
+        return true;
+    }
+
+    const LeafSpec& leaf_;
+    Shredded& out_;
+};
 
 // ---- per-chunk metadata captured while streaming pages --------------------
 
@@ -900,12 +1094,20 @@ bool validate_child(const ArrowArray& child, const ColumnSpec& s,
 // below, which own the elements until encoding is done. Nothing is copied twice.
 pq::SchemaElement schema_element(const SchemaNode& s) {
     pq::SchemaElement e;
-    e.repetition_type = s.optional ? pq::FieldRepetitionType::OPTIONAL
-                                   : pq::FieldRepetitionType::REQUIRED;
+    e.repetition_type = s.repeated   ? pq::FieldRepetitionType::REPEATED
+                        : s.optional ? pq::FieldRepetitionType::OPTIONAL
+                                     : pq::FieldRepetitionType::REQUIRED;
     e.name = std::string_view(s.name);
     if (s.is_group) {
         // A group (struct) has no physical type; it declares num_children.
         e.num_children = s.num_children;
+        if (s.list_group || s.map_group) {
+            e.converted_type = s.list_group ? pq::ConvertedType::LIST : pq::ConvertedType::MAP;
+            pq::LogicalType lt;
+            if (s.list_group) lt.LIST = nanom::empty_struct{};
+            else lt.MAP = nanom::empty_struct{};
+            e.logicalType = lt;
+        }
     } else {
         e.type = s.type;
         if (s.type == pq::Type::FIXED_LEN_BYTE_ARRAY) e.type_length = s.type_length;
@@ -989,6 +1191,148 @@ bool serialize_footer(const N2PWriter& w, std::vector<std::byte>& out, std::stri
     return true;
 }
 
+// One column chunk's pages: [dictionary page,] data page. `level_prefix` is the data page's leading
+// repetition / definition levels (empty for a REQUIRED column outside any list), `num_levels` the
+// page's value count including nulls, `validity` which entries of `arr` are values.
+void write_leaf_pages(N2PWriter& w, const ArrowArray& arr, const ColumnSpec& s, const std::uint8_t* value_validity,
+                      const std::vector<std::uint8_t>& level_prefix, std::size_t num_levels, bool has_levels,
+                      ColumnChunkMeta& c) {
+    const ArrowArray* child = &arr;
+    if (s.extract == Extract::ByteArray) {
+        ByteArrayPages pages = build_byte_array_pages(*child, s, value_validity, w.encoding);
+        if (pages.stats.has_minmax) {
+            c.has_minmax = true;
+            c.min_value.assign(pages.stats.min);
+            c.max_value.assign(pages.stats.max);
+        }
+        if (pages.use_dictionary) {
+            // dictionary page
+            auto dict_comp = compress_page(pages.dict_body, w.codec);
+            auto dict_hdr = dictionary_page_header(
+                pages.dict_size, pages.dict_body.size(), dict_comp.size());
+            c.dictionary_page_offset = w.offset;
+            c.has_dictionary = true;
+            PageBytes dp = emit_page(w, dict_hdr, dict_comp, pages.dict_body.size());
+            // data page (RLE_DICTIONARY), def levels first.
+            std::vector<std::uint8_t> data_body = level_prefix;
+            data_body.insert(data_body.end(), pages.data_body.begin(), pages.data_body.end());
+            auto data_comp = compress_page(data_body, w.codec);
+            auto data_hdr = data_page_header(
+                num_levels, pq::Encoding::RLE_DICTIONARY,
+                data_body.size(), data_comp.size());
+            c.data_page_offset = w.offset;
+            PageBytes vp = emit_page(w, data_hdr, data_comp, data_body.size());
+            c.total_uncompressed = dp.uncompressed + vp.uncompressed;
+            c.total_compressed = dp.on_disk + vp.on_disk;
+            c.encodings = {pq::Encoding::PLAIN, pq::Encoding::RLE_DICTIONARY};
+            if (has_levels) c.encodings.push_back(pq::Encoding::RLE);
+        } else {
+            // PLAIN / DELTA_BYTE_ARRAY data page, def levels first.
+            std::vector<std::uint8_t> data_body = level_prefix;
+            data_body.insert(data_body.end(), pages.data_body.begin(), pages.data_body.end());
+            auto data_comp = compress_page(data_body, w.codec);
+            auto data_hdr = data_page_header(
+                num_levels, pages.data_encoding,
+                data_body.size(), data_comp.size());
+            c.data_page_offset = w.offset;
+            PageBytes vp = emit_page(w, data_hdr, data_comp, data_body.size());
+            c.total_uncompressed = vp.uncompressed;
+            c.total_compressed = vp.on_disk;
+            c.encodings = {pages.data_encoding};
+            if (has_levels) c.encodings.push_back(pq::Encoding::RLE);
+        }
+    } else {
+        std::vector<std::uint8_t> body = level_prefix;
+        pq::Encoding enc = pq::Encoding::PLAIN;
+        fixed_stats(*child, s, value_validity, c);
+        if (s.extract == Extract::Bool) {
+            auto v = build_plain_bool(*child, value_validity);
+            body.insert(body.end(), v.begin(), v.end());
+        } else if (s.extract != Extract::Null) {  // Null type: no values
+            auto v = build_plain_fixed(*child, s, value_validity);
+            enc = encode_fixed_values(v, s, w.encoding);
+            body.insert(body.end(), v.begin(), v.end());
+        }
+        auto comp = compress_page(body, w.codec);
+        auto hdr = data_page_header(
+            num_levels, enc,
+            body.size(), comp.size());
+        c.data_page_offset = w.offset;
+        PageBytes vp = emit_page(w, hdr, comp, body.size());
+        c.total_uncompressed = vp.uncompressed;
+        c.total_compressed = vp.on_disk;
+        c.encodings = {enc};
+        if (has_levels) c.encodings.push_back(pq::Encoding::RLE);
+    }
+
+}
+
+// A leaf under a list or map: shred the batch into levels, then write its pages like any other.
+int write_list_leaf(N2PWriter& w, const LeafSpec& leaf, const ArrowArray* batch, RowGroupMeta& rg) {
+    const ColumnSpec& s = leaf.col;
+    // The leaf array: follow the path's first entries (positions are checked by the shredder).
+    const ArrowArray* cur = batch;
+    if (cur->children == nullptr || leaf.path_idx[0] >= cur->n_children) {
+        w.last_error = "batch structure does not match the schema";
+        return N2P_INVALID_ARGUMENT;
+    }
+    const ArrowArray* column = cur->children[leaf.path_idx[0]];
+    cur = column;
+    for (const PathStep& st : leaf.steps) {
+        if (st.kind == StepKind::Leaf) break;
+        const ArrowArray* next = nullptr;
+        if (cur->children != nullptr && cur->n_children >= 1) {
+            if (st.kind == StepKind::Struct) {
+                if (st.child < cur->n_children) next = cur->children[st.child];
+            } else if (st.kind == StepKind::Map) {
+                const ArrowArray* entries = cur->children[0];
+                if (entries->children != nullptr && entries->n_children == 2) next = entries->children[st.child];
+            } else {
+                next = cur->children[0];
+            }
+        }
+        if (next == nullptr) {
+            w.last_error = "batch structure does not match the schema";
+            return N2P_INVALID_ARGUMENT;
+        }
+        cur = next;
+    }
+    const ArrowArray* leaf_arr = cur;
+    std::string err;
+    if (!validate_child(*leaf_arr, s, leaf_arr->length, err)) {
+        w.last_error = err;
+        return N2P_INVALID_ARGUMENT;
+    }
+    Shredded sh;
+    sh.present.assign(static_cast<std::size_t>((leaf_arr->length + 7) / 8), 0);
+    const std::size_t rows = static_cast<std::size_t>(batch->length);
+    sh.rep.reserve(rows);
+    sh.def.reserve(rows);
+    Shredder shred(leaf, sh);
+    for (std::int64_t e = 0; e < batch->length; ++e) {
+        if (!shred.row(column, e, err)) {
+            w.last_error = err;
+            return N2P_INVALID_ARGUMENT;
+        }
+    }
+    std::vector<std::uint8_t> level_prefix = encode_definition_levels(sh.rep, leaf.rep_bit_width);
+    const auto def_bytes = encode_definition_levels(sh.def, leaf.def_bit_width);
+    level_prefix.insert(level_prefix.end(), def_bytes.begin(), def_bytes.end());
+    const std::uint8_t* value_validity =
+        sh.present_count < static_cast<std::size_t>(leaf_arr->length) ? sh.present.data() : nullptr;
+
+    ColumnChunkMeta c;
+    c.type = s.type;
+    c.path = leaf.path_names;
+    c.num_values = static_cast<std::int64_t>(sh.def.size());
+    c.file_offset = w.offset;
+    c.null_count = static_cast<std::int64_t>(sh.def.size() - sh.present_count);
+    write_leaf_pages(w, *leaf_arr, s, value_validity, level_prefix, sh.def.size(), true, c);
+    rg.total_byte_size += c.total_uncompressed;
+    rg.columns.push_back(std::move(c));
+    return N2P_OK;
+}
+
 int write_one_batch(N2PWriter& w, const ArrowSchema* schema, const ArrowArray* batch) {
     if (schema == nullptr || batch == nullptr) {
         w.last_error = "schema and batch must be non-null";
@@ -1042,6 +1386,11 @@ int write_one_batch(N2PWriter& w, const ArrowSchema* schema, const ArrowArray* b
 
     try {
         for (const LeafSpec& leaf : w.leaves) {
+            if (leaf.has_list) {
+                const int status = write_list_leaf(w, leaf, batch, rg);
+                if (status != N2P_OK) return status;
+                continue;
+            }
             // Walk the array tree to the leaf, capturing each node's array (used
             // for definition levels at every OPTIONAL node on the path).
             std::vector<const ArrowArray*> nodes_arr;
@@ -1106,73 +1455,7 @@ int write_one_batch(N2PWriter& w, const ArrowSchema* schema, const ArrowArray* b
                 c.null_count = static_cast<std::int64_t>(n - present_count);
             }
 
-            if (s.extract == Extract::ByteArray) {
-                ByteArrayPages pages = build_byte_array_pages(*child, s, value_validity, w.encoding);
-                if (pages.stats.has_minmax) {
-                    c.has_minmax = true;
-                    c.min_value.assign(pages.stats.min);
-                    c.max_value.assign(pages.stats.max);
-                }
-                if (pages.use_dictionary) {
-                    // dictionary page
-                    auto dict_comp = compress_page(pages.dict_body, w.codec);
-                    auto dict_hdr = dictionary_page_header(
-                        pages.dict_size, pages.dict_body.size(), dict_comp.size());
-                    c.dictionary_page_offset = w.offset;
-                    c.has_dictionary = true;
-                    PageBytes dp = emit_page(w, dict_hdr, dict_comp, pages.dict_body.size());
-                    // data page (RLE_DICTIONARY), def levels first.
-                    std::vector<std::uint8_t> data_body = def_prefix;
-                    data_body.insert(data_body.end(), pages.data_body.begin(), pages.data_body.end());
-                    auto data_comp = compress_page(data_body, w.codec);
-                    auto data_hdr = data_page_header(
-                        static_cast<std::size_t>(batch->length), pq::Encoding::RLE_DICTIONARY,
-                        data_body.size(), data_comp.size());
-                    c.data_page_offset = w.offset;
-                    PageBytes vp = emit_page(w, data_hdr, data_comp, data_body.size());
-                    c.total_uncompressed = dp.uncompressed + vp.uncompressed;
-                    c.total_compressed = dp.on_disk + vp.on_disk;
-                    c.encodings = {pq::Encoding::PLAIN, pq::Encoding::RLE_DICTIONARY};
-                    if (D > 0) c.encodings.push_back(pq::Encoding::RLE);
-                } else {
-                    // PLAIN / DELTA_BYTE_ARRAY data page, def levels first.
-                    std::vector<std::uint8_t> data_body = def_prefix;
-                    data_body.insert(data_body.end(), pages.data_body.begin(), pages.data_body.end());
-                    auto data_comp = compress_page(data_body, w.codec);
-                    auto data_hdr = data_page_header(
-                        static_cast<std::size_t>(batch->length), pages.data_encoding,
-                        data_body.size(), data_comp.size());
-                    c.data_page_offset = w.offset;
-                    PageBytes vp = emit_page(w, data_hdr, data_comp, data_body.size());
-                    c.total_uncompressed = vp.uncompressed;
-                    c.total_compressed = vp.on_disk;
-                    c.encodings = {pages.data_encoding};
-                    if (D > 0) c.encodings.push_back(pq::Encoding::RLE);
-                }
-            } else {
-                std::vector<std::uint8_t> body = def_prefix;
-                pq::Encoding enc = pq::Encoding::PLAIN;
-                fixed_stats(*child, s, value_validity, c);
-                if (s.extract == Extract::Bool) {
-                    auto v = build_plain_bool(*child, value_validity);
-                    body.insert(body.end(), v.begin(), v.end());
-                } else if (s.extract != Extract::Null) {  // Null type: no values
-                    auto v = build_plain_fixed(*child, s, value_validity);
-                    enc = encode_fixed_values(v, s, w.encoding);
-                    body.insert(body.end(), v.begin(), v.end());
-                }
-                auto comp = compress_page(body, w.codec);
-                auto hdr = data_page_header(
-                    static_cast<std::size_t>(batch->length), enc,
-                    body.size(), comp.size());
-                c.data_page_offset = w.offset;
-                PageBytes vp = emit_page(w, hdr, comp, body.size());
-                c.total_uncompressed = vp.uncompressed;
-                c.total_compressed = vp.on_disk;
-                c.encodings = {enc};
-                if (D > 0) c.encodings.push_back(pq::Encoding::RLE);
-            }
-
+            write_leaf_pages(w, *child, s, value_validity, def_prefix, n, D > 0, c);
             rg.total_byte_size += c.total_uncompressed;
             rg.columns.push_back(std::move(c));
         }

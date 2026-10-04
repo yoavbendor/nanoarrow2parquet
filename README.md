@@ -63,14 +63,20 @@ so the same Arrow data feeds either writer (Parquet or Lance).
 | `u` `U` `z` `Z` | BYTE_ARRAY | `RLE_DICTIONARY` or `PLAIN`, chosen per column by size |
 | `n` | all-null INT32 | OPTIONAL, every value null |
 | `+s` | group (struct) | nested, recurses to leaf columns |
+| `+l` `+L` | `LIST` group: `list` / `element` (three-level) | repetition + definition levels, any nesting (lists of lists, of structs, structs of lists) |
+| `+m` | `MAP` group: `key_value` / `key`, `value` | keys REQUIRED, values keep their nullability |
 | any nullable | + definition levels | OPTIONAL repetition, present values only |
 
 Every column chunk carries min / max / null-count statistics. `n2p_writer_set_encoding()` picks
 AUTO (the table above), PLAIN, DELTA (`DELTA_BINARY_PACKED` / `DELTA_BYTE_ARRAY`) or
 `BYTE_STREAM_SPLIT` (floats).
 
-**Out of scope (TODO):** nested list/map columns (repetition levels), page indexes, bloom
-filters.
+Leaves under a list or map are shredded into repetition and definition levels (Dremel). Entries
+under a null or empty list are skipped, as Parquet requires, and so are child values that Arrow
+allows under a null list. Offsets that run backwards or past their child, a null where the schema
+allows none, and sliced arrays are refused.
+
+**Out of scope (TODO):** fixed-size lists (`+w:N`), page indexes, bloom filters.
 
 ### Gotchas & limits
 
@@ -85,8 +91,8 @@ filters.
   can be null.
 - **`uint64` is written as INT64 + the `UINT_64` logical type** (bits identical). Some
   readers surface it as signed if they ignore the logical type — values are exact.
-- **Lists/maps are unsupported** (no repetition levels). Flatten, or store a child table
-  joined by an id column (this is what the `pcapng2parquet` example does per layer).
+- **Arrays must not be sliced** (a non-zero ArrowArray `offset` is refused), for lists and maps as
+  for every other column.
 
 ## Python bindings (`nanoarrow-io`)
 
@@ -167,9 +173,8 @@ n2p_writer_close(w);                              // writes the footer, frees w
 
 **Don't**
 - Don't put a null in a REQUIRED (non-nullable) column — it is rejected.
-- Don't expect lists/maps, page indexes, bloom filters, or a read path — none exist (chunk-level
-  statistics do). Flatten
-  lists or emit a child table joined by an id column.
+- Don't expect fixed-size lists, page indexes, bloom filters, or a read path — none exist (lists,
+  maps and chunk-level statistics do).
 - Don't skip `close()` — a file with no footer is unreadable (no partial-read fallback).
 - Don't rely on `uint64` deserializing as unsigned in every reader; it is stored as INT64 + the
   `UINT_64` logical type (bits exact).

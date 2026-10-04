@@ -119,6 +119,11 @@ READ_BACK = {pa.large_string(): pa.string(), pa.large_binary(): pa.binary(), pa.
 def expected_type(t):
     if pa.types.is_struct(t):
         return pa.struct([pa.field(f.name, expected_type(f.type), f.nullable) for f in t])
+    if pa.types.is_map(t):  # Parquet's MAP: key_value { key, value }
+        return pa.map_(pa.field("key", expected_type(t.key_type), False),
+                       pa.field("value", expected_type(t.item_type), t.item_field.nullable))
+    if pa.types.is_list(t) or pa.types.is_large_list(t):  # Parquet's LIST: list { element }
+        return pa.list_(pa.field("element", expected_type(t.value_type), t.value_field.nullable))
     return READ_BACK.get(t, t)
 
 
@@ -174,6 +179,63 @@ def nested_column(rng, n, density):
     return outer, pa.field("nested", outer.type, nullable=density > 0)
 
 
+def list_columns(rng, n, density):
+    """Lists and maps: every value kind under a list, lists of lists and of structs, structs of lists,
+    large lists, maps, empty lists, and null lists hiding non-empty child ranges (legal in Arrow;
+    those children must not be written)."""
+    nullable = density > 0
+
+    def maybe(v):
+        return None if nullable and rng.random() < density else v
+
+    def lists(make, max_len=4):
+        return [maybe([maybe(make()) if nullable else make() for _ in range(rng.randrange(max_len + 1))])
+                for _ in range(n)]
+
+    def field(name, typ):
+        return pa.field(name, typ, nullable)
+
+    def elem(typ):
+        return pa.field("item", typ, nullable)
+
+    words = ["", "a", "héllo", "日本語", "x" * 40]
+    cols = []
+    cols.append((pa.array(lists(lambda: rng.randrange(-1000, 1000)), pa.list_(elem(pa.int32()))),
+                 field("l_i32", pa.list_(elem(pa.int32())))))
+    cols.append((pa.array(lists(lambda: words[rng.randrange(len(words))]), pa.list_(elem(pa.string()))),
+                 field("l_str", pa.list_(elem(pa.string())))))
+    cols.append((pa.array(lists(lambda: f"u{rng.random()}"), pa.list_(elem(pa.string()))),
+                 field("l_str_unique", pa.list_(elem(pa.string())))))
+    cols.append((pa.array(lists(lambda: rng.random() < 0.5), pa.list_(elem(pa.bool_()))),
+                 field("l_bool", pa.list_(elem(pa.bool_())))))
+    cols.append((pa.array(lists(lambda: rng.gauss(0, 1)), pa.large_list(elem(pa.float32()))),
+                 field("ll_f32", pa.large_list(elem(pa.float32())))))
+    cols.append((pa.array(lists(lambda: bytes(rng.randrange(256) for _ in range(4))), pa.list_(elem(pa.binary(4)))),
+                 field("l_fsb", pa.list_(elem(pa.binary(4))))))
+    inner = pa.list_(elem(pa.int64()))
+    cols.append((pa.array(lists(lambda: [maybe(rng.randrange(1 << 40)) if nullable else rng.randrange(1 << 40)
+                                         for _ in range(rng.randrange(3))] if not nullable or rng.random() > density else None, 3),
+                          pa.list_(pa.field("item", inner, nullable))),
+                 field("l_l_i64", pa.list_(pa.field("item", inner, nullable)))))
+    st = pa.struct([pa.field("a", pa.int32(), nullable), pa.field("s", pa.string(), nullable)])
+    cols.append((pa.array(lists(lambda: {"a": maybe(rng.randrange(100)), "s": maybe(f"s{rng.randrange(9)}")}),
+                          pa.list_(pa.field("item", st, nullable))),
+                 field("l_struct", pa.list_(pa.field("item", st, nullable)))))
+    sl = pa.struct([pa.field("x", pa.list_(elem(pa.float64())), nullable), pa.field("y", pa.int32(), nullable)])
+    cols.append((pa.array([maybe({"x": maybe([maybe(rng.random()) if nullable else rng.random()
+                                             for _ in range(rng.randrange(3))]), "y": maybe(rng.randrange(9))})
+                           for _ in range(n)], sl), field("s_list", sl)))
+    mt = pa.map_(pa.string(), pa.field("value", pa.int32(), nullable))
+    cols.append((pa.array([maybe([(f"k{j}", maybe(rng.randrange(50))) for j in range(rng.randrange(4))])
+                           for _ in range(n)], mt), field("m_str_i32", mt)))
+    if nullable:  # null lists over non-empty child ranges
+        values = pa.array([rng.randrange(1000) for _ in range(3 * n)], pa.int32())
+        offsets = pa.array([3 * i for i in range(n + 1)], pa.int32())
+        cols.append((pa.ListArray.from_arrays(offsets, values, mask=pa.array([rng.random() < 0.4 for _ in range(n)])),
+                     field("l_hidden", pa.list_(pa.field("item", pa.int32(), False)))))
+    return [c for c, _ in cols], [f for _, f in cols]
+
+
 def make_cases(rng):
     cases = []
     for density in (0.0, 0.3, 1.0):
@@ -191,6 +253,13 @@ def make_cases(rng):
                     fields.append(pa.field("null_type", pa.null(), True))
                 parts.append(pa.RecordBatch.from_arrays(arrays, schema=pa.schema(fields)))
             cases.append((f"nulls{density}_rows{n}x{batches}", parts))
+    for density in (0.0, 0.3):
+        for n, batches in ((1, 1), (500, 1), (300, 3)):
+            parts = []
+            for _ in range(batches):
+                arrays, fields = list_columns(rng, n, density)
+                parts.append(pa.RecordBatch.from_arrays(arrays, schema=pa.schema(fields)))
+            cases.append((f"lists{density}_rows{n}x{batches}", parts))
     return cases
 
 
@@ -247,15 +316,66 @@ def expected_stats(arr):
     return nulls, min(values, key=key), max(values, key=key)
 
 
+def leaf_levels(value, typ, path):
+    """(level entries, non-null leaf values) of one row along a Parquet path, by Dremel's rules: a
+    null or an empty list is one entry, every list element is its own."""
+    if value is None:
+        return 1, []
+    if pa.types.is_struct(typ):
+        f = typ.field(path[0])
+        return leaf_levels(value[path[0]], f.type, path[1:])
+    if pa.types.is_map(typ):  # path: key_value, key|value
+        if not value:
+            return 1, []
+        pos, t = (0, typ.key_type) if path[1] == "key" else (1, typ.item_type)
+        entries, values = 0, []
+        for kv in value:
+            e, v = leaf_levels(kv[pos], t, path[2:])
+            entries, values = entries + e, values + v
+        return entries, values
+    if pa.types.is_list(typ) or pa.types.is_large_list(typ):  # path: list, element
+        if not value:
+            return 1, []
+        entries, values = 0, []
+        for x in value:
+            e, v = leaf_levels(x, typ.value_type, path[2:])
+            entries, values = entries + e, values + v
+        return entries, values
+    return 1, [value]
+
+
+def list_leaf_stats(table, path_in_schema):
+    """(null_count, values) of a leaf under a list or map: entries that are not values are nulls."""
+    parts = path_in_schema.split(".")
+    col = table.schema.field(parts[0])
+    entries, values = 0, []
+    for v in table[parts[0]].to_pylist():
+        e, vs = leaf_levels(v, col.type, parts[1:])
+        entries, values = entries + e, values + vs
+    return entries - len(values), values
+
+
 def check_statistics(path, failures, name):
     pf = pq.ParquetFile(path)
     for g in range(pf.metadata.num_row_groups):
-        leaves = leaf_columns(pf.read_row_group(g))
+        table = pf.read_row_group(g)
+        leaves = leaf_columns(table)
         rg = pf.metadata.row_group(g)
         for c in range(rg.num_columns):
             cc = rg.column(c)
             st = cc.statistics
             arr = leaves.get(cc.path_in_schema)
+            if arr is None and pf.metadata.schema.column(c).max_repetition_level > 0:
+                nulls, values = list_leaf_stats(table, cc.path_in_schema)
+                leaf_type = pf.schema_arrow.field(cc.path_in_schema.split(".")[0]).type
+                arr = pa.array(values, type=leaf_arrow_type(leaf_type, cc.path_in_schema.split(".")[1:]))
+                _, mn, mx = expected_stats(arr)
+                if st is None or st.null_count != nulls:
+                    failures.append(f"{name}: rg {g} {cc.path_in_schema}: null_count "
+                                    f"{st.null_count if st else None} != {nulls}")
+                elif mn is not None and (not st.has_min_max or st.min != mn or st.max != mx):
+                    failures.append(f"{name}: rg {g} {cc.path_in_schema}: min/max differ")
+                continue
             if st is None or arr is None:
                 failures.append(f"{name}: rg {g} {cc.path_in_schema}: no statistics")
                 continue
@@ -270,6 +390,18 @@ def check_statistics(path, failures, name):
                 failures.append(f"{name}: rg {g} {cc.path_in_schema}: no min/max")
             elif st.min != mn or st.max != mx:
                 failures.append(f"{name}: rg {g} {cc.path_in_schema}: min/max {st.min!r}/{st.max!r} != {mn!r}/{mx!r}")
+
+
+def leaf_arrow_type(typ, path):
+    """The Arrow type of the leaf at a Parquet path below `typ`."""
+    while path:
+        if pa.types.is_struct(typ):
+            typ, path = typ.field(path[0]).type, path[1:]
+        elif pa.types.is_map(typ):
+            typ, path = (typ.key_type if path[1] == "key" else typ.item_type), path[2:]
+        else:
+            typ, path = typ.value_type, path[2:]
+    return typ
 
 
 def check_metadata(path, rs_meta, failures, name):
@@ -360,8 +492,12 @@ def main():
                         ok, why = False, f"read failed: {e}"
                     if not ok:
                         failures.append(f"{case}: {reader}: {why}")
-                check_metadata(path, rs_meta, failures, case)
-                check_statistics(path, failures, case)
+                for check in (lambda: check_metadata(path, rs_meta, failures, case),
+                              lambda: check_statistics(path, failures, case)):
+                    try:
+                        check()
+                    except Exception as e:  # noqa: BLE001 - a file the checks cannot read is a finding
+                        failures.append(f"{case}: check failed: {e}")
         # a writer that receives no batch still produces a valid, empty file
         path = os.path.join(tmp, "empty.parquet")
         writer.write(path, [], "zstd")
