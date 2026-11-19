@@ -780,8 +780,24 @@ HeaderBytes dictionary_page_header(std::size_t num_values, std::size_t uncompres
 
 // ---- writer object --------------------------------------------------------
 
+// The S3 output of an s3:// path (implemented in s3_output.cpp, built with N2P_S3). Declared here, not in a
+// header, so the single-header amalgamation needs nothing from it unless N2P_HAVE_S3 is defined.
+#ifdef N2P_HAVE_S3
+namespace n2p::s3 {
+struct Sink;
+Sink* open(const std::string& uri, std::string& error);  // null and `error` on failure
+std::ostream& stream(Sink* sink);
+bool commit(Sink* sink, std::string& error);              // publishes the object; consumes the sink
+void discard(Sink* sink);                                 // publishes nothing; consumes the sink
+}  // namespace n2p::s3
+#endif
+
 struct N2PWriter {
-    std::ofstream out;
+    std::ofstream file;               // a local path
+    std::ostream* out = nullptr;      // the open output (file or S3 stream); null while not open
+#ifdef N2P_HAVE_S3
+    n2p::s3::Sink* s3 = nullptr;      // an s3:// path
+#endif
     std::string path;
     std::int64_t offset = 0;
     n2p::pq::CompressionCodec codec = n2p::pq::CompressionCodec::ZSTD;
@@ -802,8 +818,8 @@ namespace {
 constexpr char kMagic[4] = {'P', 'A', 'R', '1'};
 
 void write_bytes(N2PWriter& w, std::span<const std::uint8_t> bytes) {
-    w.out.write(reinterpret_cast<const char*>(bytes.data()),
-                static_cast<std::streamsize>(bytes.size()));
+    w.out->write(reinterpret_cast<const char*>(bytes.data()),
+                 static_cast<std::streamsize>(bytes.size()));
     w.offset += static_cast<std::int64_t>(bytes.size());
 }
 
@@ -1223,7 +1239,7 @@ int write_one_batch(N2PWriter& w, const ArrowSchema* schema, const ArrowArray* b
 
     w.row_groups.push_back(std::move(rg));
     w.total_rows += batch->length;
-    if (!w.out.good()) {
+    if (!w.out->good()) {
         w.last_error = "I/O error while writing column data";
         return N2P_IO_ERROR;
     }
@@ -1243,11 +1259,29 @@ int n2p_writer_open(N2PWriter** out, const char* path) {
     }
     auto* w = new N2PWriter();
     w->path = path;
-    w->out.open(path, std::ios::binary | std::ios::trunc);
-    if (!w->out.is_open()) {
-        w->last_error = std::string("cannot open output file: ") + path;
-        *out = w;  // hand back so the caller can read the error, then close
+    if (std::string_view(path).starts_with("s3://")) {
+#ifdef N2P_HAVE_S3
+        std::string err;
+        w->s3 = n2p::s3::open(path, err);
+        if (w->s3 == nullptr) {
+            w->last_error = err;
+            *out = w;
+            return N2P_IO_ERROR;
+        }
+        w->out = &n2p::s3::stream(w->s3);
+#else
+        w->last_error = std::string("built without S3 support (configure with -DN2P_S3=ON): ") + path;
+        *out = w;
         return N2P_IO_ERROR;
+#endif
+    } else {
+        w->file.open(path, std::ios::binary | std::ios::trunc);
+        if (!w->file.is_open()) {
+            w->last_error = std::string("cannot open output file: ") + path;
+            *out = w;  // hand back so the caller can read the error, then close
+            return N2P_IO_ERROR;
+        }
+        w->out = &w->file;
     }
     n2p::write_bytes(*w, std::span<const std::uint8_t>(
                              reinterpret_cast<const std::uint8_t*>(n2p::kMagic), 4));
@@ -1288,7 +1322,7 @@ int n2p_writer_write_batch(N2PWriter* w, const struct ArrowSchema* schema,
     if (w == nullptr) {
         return N2P_INVALID_ARGUMENT;
     }
-    if (!w->out.is_open()) {
+    if (w->out == nullptr) {
         w->last_error = "writer is not open";
         return N2P_IO_ERROR;
     }
@@ -1300,7 +1334,7 @@ int n2p_writer_close(N2PWriter* w) {
         return N2P_INVALID_ARGUMENT;
     }
     int status = N2P_OK;
-    if (w->out.is_open() && !w->footer_written) {
+    if (w->out != nullptr && !w->footer_written) {
         std::vector<std::byte> footer;
         std::string err;
         if (!n2p::serialize_footer(*w, footer, err) || footer.size() > UINT32_MAX) {
@@ -1320,12 +1354,36 @@ int n2p_writer_close(N2PWriter* w) {
                                      reinterpret_cast<const std::uint8_t*>(n2p::kMagic), 4));
         }
         w->footer_written = true;
-        w->out.flush();
-        if (!w->out.good()) {
+        w->out->flush();
+        if (!w->out->good()) {
             status = N2P_IO_ERROR;
         }
-        w->out.close();
+#ifdef N2P_HAVE_S3
+        if (w->s3 != nullptr) {
+            // An S3 object is published only when the file is complete: a failed close leaves nothing behind.
+            if (status == N2P_OK) {
+                std::string err;
+                if (!n2p::s3::commit(w->s3, err)) {  // consumes the sink
+                    w->last_error = err;
+                    status = N2P_IO_ERROR;
+                }
+            } else {
+                n2p::s3::discard(w->s3);
+            }
+            w->s3 = nullptr;
+        } else
+#endif
+        {
+            w->file.close();
+        }
+        w->out = nullptr;
     }
+#ifdef N2P_HAVE_S3
+    if (w->s3 != nullptr) {  // never closed with a footer: the object is never published
+        n2p::s3::discard(w->s3);
+        w->s3 = nullptr;
+    }
+#endif
     delete w;
     return status;
 }
