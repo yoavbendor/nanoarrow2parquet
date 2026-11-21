@@ -96,6 +96,35 @@ endif()
 
 # --- library ---
 add_library(nanoarrow2parquet STATIC src/writer.cpp)
+
+# s3:// outputs (N2P_S3=ON): nanos3reader's spilling writer, which needs libcurl. Off by default, so the library
+# keeps no network dependency. The pin is a commit (nanos3reader's 0.6.0 range adapters); switch to its tag once
+# that exists.
+option(N2P_S3 "Write s3:// outputs through nanos3reader (needs libcurl)" OFF)
+if(N2P_S3)
+    find_package(CURL REQUIRED)
+    set(NANOS3READER_CRYPTO bundled CACHE STRING "" FORCE)  # no OpenSSL dependency
+    set(NANOS3READER_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(NANOS3READER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(NANOS3READER_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+    set(NANOS3READER_BUILD_INTEGRATION_TESTS OFF CACHE BOOL "" FORCE)
+    set(NANOS3READER_BUILD_PYTHON_BINDINGS OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(nanos3reader
+        GIT_REPOSITORY https://github.com/yoavbendor/nanos3reader.git
+        GIT_TAG 65aa2e7a561a934d59b9f7c123420018502213de
+    )
+    FetchContent_MakeAvailable(nanos3reader)
+    target_sources(nanoarrow2parquet PRIVATE src/s3_output.cpp)
+    target_compile_definitions(nanoarrow2parquet PRIVATE N2P_HAVE_S3=1)
+    target_link_libraries(nanoarrow2parquet PRIVATE nanos3reader::nanos3reader)
+    if(N2P_BUILD_TESTS)
+        # Writes the same batches to a local file and to s3://, and compares them (needs an S3 endpoint).
+        add_executable(test_s3_output tests/test_s3_output.cpp)
+        target_link_libraries(test_s3_output PRIVATE nanoarrow2parquet nanoarrow_static nanos3reader::nanos3reader)
+        add_test(NAME s3_output COMMAND test_s3_output)
+        set_tests_properties(s3_output PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+endif()
 target_include_directories(nanoarrow2parquet PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 target_include_directories(nanoarrow2parquet PRIVATE
