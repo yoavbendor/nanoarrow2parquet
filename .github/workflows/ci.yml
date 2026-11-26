@@ -17,10 +17,18 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-        with:
-          # The pcapng2parquet example vendors nanotins as a submodule under
-          # examples/pcapng2parquet/extern; fetch it so the example configures.
-          submodules: recursive
+
+      # The pcapng2parquet example vendors nanotins as a submodule under
+      # examples/pcapng2parquet/extern. nanotins is a private repository, which this workflow's token
+      # cannot clone, and a failed submodule clone inside actions/checkout fails the whole job.
+      # Fetch it best-effort instead: when it is unavailable, CMake skips only pcapng2parquet (see
+      # CMakeLists.txt) and everything else still builds and tests.
+      - name: Fetch nanotins submodule (optional)
+        env:
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          git submodule update --init --recursive --depth=1 ||
+            echo "::notice::nanotins submodule unavailable; pcapng2parquet is skipped"
 
       - name: Install toolchain + pyarrow
         run: |
